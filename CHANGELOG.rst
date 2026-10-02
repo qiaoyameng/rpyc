@@ -1,3 +1,14 @@
+Unreleased
+==========
+
+- Added ``rpyc.utils.lease`` (:class:`~rpyc.utils.lease.Lease` and
+  :class:`~rpyc.utils.lease.LeaseRevoked`): explicit, server-side lease
+  wrappers that bind a group of remote references (the wrapped object plus
+  all attributes, call results, and iterators derived from it) to a revocable
+  generation. Revocation is enforced by the server on every newly dispatched
+  operation, is idempotent, and releases lease records (as does garbage
+  collection of the leased proxies).
+
 6.0.1
 =====
 Date: 2024-09-24
@@ -797,4 +808,3 @@ Known Issues
 Known Issues
 ^^^^^^^^^^^^
 * Windows - pipe server doesn't work
-

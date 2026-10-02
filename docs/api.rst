@@ -57,9 +57,13 @@ Server-Side
    api/utils_server
    api/utils_authenticators
    api/utils_registry
+   api/utils_lease
 
 * :ref:`api-server` - The core implementation of RPyC servers; includes the implementation of
   the forking and threaded servers.
+
+* :ref:`api-lease` - Explicit, server-revocable *lease* wrappers that bound the lifetime of a
+  group of remote references to a single session operation.
 
 * :ref:`api-registry` - Implementation of the Service Registry; the registry is a bonjour-like
   discovery agent, with which RPyC servers register themselves, and allows clients to locate
