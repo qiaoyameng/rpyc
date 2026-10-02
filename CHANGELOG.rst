@@ -1,3 +1,16 @@
+Unreleased
+==========
+
+- Added ``rpyc.asynciter``: an explicit adapter for iterating remote
+  asynchronous iterators (e.g. async generators) with ``async for`` without
+  blocking the client's event loop. Introduces the ``async-iter/1`` protocol
+  (``HANDLE_AITER_NEW``/``HANDLE_AITER_ANEXT``/``HANDLE_AITER_ACLOSE`` with a
+  reserved, explicitly rejected ``HANDLE_AITER_ATHROW``), lazy capability
+  negotiation via ``HANDLE_GETCAPS`` (see
+  ``Connection.get_remote_capabilities``), serialized pulls, cooperative
+  remote ``finally`` execution on close, and deterministic cleanup on
+  disconnect.
+
 6.0.1
 =====
 Date: 2024-09-24

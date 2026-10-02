@@ -10,6 +10,7 @@ import collections
 import concurrent.futures as c_futures
 import os
 import threading
+import weakref
 
 from threading import Lock, Condition, RLock
 from rpyc.lib import spawn, Timeout, get_methods, get_id_pack, hasattr_static
@@ -17,6 +18,7 @@ from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # 
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
 from rpyc.core import consts, brine, vinegar, netref
 from rpyc.core.async_ import AsyncResult
+from rpyc.core.aio import RemoteAsyncIterator
 
 
 class PingError(Exception):
@@ -150,6 +152,10 @@ class Connection(object):
                    from the :data:`default configuration <DEFAULT_CONFIG>`)
     """
 
+    #: protocol capabilities this endpoint supports; negotiated lazily
+    #: via the HANDLE_GETCAPS request (see get_remote_capabilities)
+    CAPABILITIES = frozenset([consts.CAP_ASYNC_ITER_V1])
+
     def __init__(self, root, channel, config={}):
         self._closed = True
         self._config = DEFAULT_CONFIG.copy()
@@ -169,6 +175,8 @@ class Connection(object):
         self._proxy_cache = WeakValueDict()
         self._netref_classes_cache = {}
         self._remote_root = None
+        self._remote_caps = None
+        self._remote_async_iters = weakref.WeakSet()
         self._send_queue = []
         self._local_root = root
         self._closed = False
@@ -202,6 +210,14 @@ class Connection(object):
         self._channel.close()
         self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
+        for async_iter in list(getattr(self, "_remote_async_iters", ())):
+            # close remote async iterators deterministically: an in-flight
+            # pull keeps the adapter alive, so __del__ alone cannot be
+            # relied upon to run the remote generator's finally blocks
+            try:
+                async_iter.close(timeout=5)
+            except Exception:
+                pass
         self._local_objects.clear()
         self._proxy_cache.clear()
         self._netref_classes_cache.clear()
@@ -777,6 +793,22 @@ class Connection(object):
             self._remote_root = self.sync_request(consts.HANDLE_GETROOT)
         return self._remote_root
 
+    def get_remote_capabilities(self):  # serving
+        """Lazily negotiates and returns the remote party's protocol
+        capabilities as a frozenset of strings (e.g. ``async-iter/1``).
+
+        Endpoints that predate capability negotiation reject the
+        ``HANDLE_GETCAPS`` request; they are reported as having *no*
+        capabilities and must not be mistaken for supporting any of them.
+        """
+        if self._remote_caps is None:
+            try:
+                caps = self.sync_request(consts.HANDLE_GETCAPS)
+            except Exception:
+                caps = ()
+            self._remote_caps = frozenset(caps)
+        return self._remote_caps
+
     def _check_attr(self, obj, name, perm):  # attribute access
         config = self._config
         if not config[perm]:
@@ -829,6 +861,11 @@ class Connection(object):
             consts.HANDLE_BUFFITER: cls._handle_buffiter,
             consts.HANDLE_OLDSLICING: cls._handle_oldslicing,
             consts.HANDLE_CTXEXIT: cls._handle_ctxexit,
+            consts.HANDLE_GETCAPS: cls._handle_getcaps,
+            consts.HANDLE_AITER_NEW: cls._handle_aiter_new,
+            consts.HANDLE_AITER_ANEXT: cls._handle_aiter_anext,
+            consts.HANDLE_AITER_ACLOSE: cls._handle_aiter_aclose,
+            consts.HANDLE_AITER_ATHROW: cls._handle_aiter_athrow,
         }
 
     def _handle_ping(self, data):  # request handler
@@ -836,6 +873,26 @@ class Connection(object):
 
     def _handle_close(self):  # request handler
         self._cleanup()
+
+    def _handle_getcaps(self):  # request handler
+        return tuple(sorted(self.CAPABILITIES))
+
+    def _handle_aiter_new(self, obj):  # request handler
+        adapter = RemoteAsyncIterator(obj)
+        self._remote_async_iters.add(adapter)
+        return adapter
+
+    def _handle_aiter_anext(self, adapter):  # request handler
+        # pump serve() while waiting so that interleaved requests on this
+        # connection (notably HANDLE_AITER_ACLOSE) are dispatched reentrantly
+        return adapter.wait_anext(self.serve)
+
+    def _handle_aiter_aclose(self, adapter):  # request handler
+        adapter.close()
+
+    def _handle_aiter_athrow(self, adapter, *args):  # request handler
+        raise NotImplementedError(
+            "athrow() is not supported by the async-iter/1 protocol")
 
     def _handle_getroot(self):  # request handler
         return self._local_root
