@@ -14,3 +14,6 @@ Async
 
 .. automodule:: rpyc.core.async_
    :members:
+
+.. automodule:: rpyc.core.cancellation
+   :members:

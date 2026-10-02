@@ -4,5 +4,11 @@ from rpyc.core.channel import Channel
 from rpyc.core.protocol import Connection, DEFAULT_CONFIG
 from rpyc.core.netref import BaseNetref
 from rpyc.core.async_ import AsyncResult, AsyncResultTimeout
+from rpyc.core.cancellation import (
+    AsyncResultCancelled,
+    CancelResult,
+    CancellationToken,
+    current_cancellation_token,
+)
 from rpyc.core.service import Service, VoidService, SlaveService, MasterService, ClassicService
 from rpyc.core.vinegar import GenericException

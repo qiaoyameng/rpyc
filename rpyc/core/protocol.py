@@ -17,6 +17,11 @@ from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # 
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
 from rpyc.core import consts, brine, vinegar, netref
 from rpyc.core.async_ import AsyncResult
+from rpyc.core.cancellation import (
+    AsyncResultCancelled,
+    CancellationToken,
+    _current_token,
+)
 
 
 class PingError(Exception):
@@ -164,11 +169,14 @@ class Connection(object):
         self._sendlock = Lock()
         self._recv_event = Condition()  # TODO: why not simply timeout? why not associate w/ recvlock? explain/redesign
         self._request_callbacks = {}
+        self._request_tokens = {}
+        self._request_state_lock = Lock()
         self._local_objects = RefCountingColl()
         self._last_traceback = None
         self._proxy_cache = WeakValueDict()
         self._netref_classes_cache = {}
         self._remote_root = None
+        self._remote_cancel_supported = None
         self._send_queue = []
         self._local_root = root
         self._closed = False
@@ -181,6 +189,7 @@ class Connection(object):
             self._receiving = False
             self._thread_pool = []
             self._thread_pool_executor = c_futures.ThreadPoolExecutor()
+        self._probe_cancel_support()
 
     def __del__(self):
         self.close()
@@ -200,6 +209,10 @@ class Connection(object):
             return
         self._closed = True
         self._channel.close()
+        with self._request_state_lock:
+            for token in self._request_tokens.values():
+                token.cancel()
+            self._request_tokens.clear()
         self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
         self._local_objects.clear()
@@ -274,7 +287,7 @@ class Connection(object):
         if self._bind_threads:
             this_thread = self._get_thread()
             data = brine.I8I8.pack(this_thread.id, this_thread._remote_thread_id) + data
-            if msg == consts.MSG_REQUEST:
+            if msg in (consts.MSG_REQUEST, consts.MSG_CANCEL):
                 this_thread._occupation_count += 1
             else:
                 this_thread._occupation_count -= 1
@@ -362,11 +375,20 @@ class Connection(object):
                 self._netref_classes_cache[id_pack] = cls
         return cls(self, id_pack)
 
-    def _dispatch_request(self, seq, raw_args):  # dispatch
+    def _dispatch_request(self, seq, raw_args, token=None):  # dispatch
         try:
             handler, args = raw_args
             args = self._unbox(args)
-            res = self._HANDLERS[handler](self, *args)
+            if token is not None and token.cancelled:
+                raise AsyncResultCancelled("request cancelled")
+            if token is None:
+                res = self._HANDLERS[handler](self, *args)
+            else:
+                token_token = _current_token.set(token)
+                try:
+                    res = self._HANDLERS[handler](self, *args)
+                finally:
+                    _current_token.reset(token_token)
         except:  # TODO: revisit how to catch handle locally, this should simplify when py2 is dropped
             # need to catch old style exceptions too
             t, v, tb = sys.exc_info()
@@ -378,9 +400,47 @@ class Connection(object):
                 raise
             if t is KeyboardInterrupt and self._config["propagate_KeyboardInterrupt_locally"]:
                 raise
-            self._send(consts.MSG_EXCEPTION, seq, self._box_exc(t, v, tb))
+            self._dispatch_send(consts.MSG_EXCEPTION, seq, self._box_exc(t, v, tb))
         else:
-            self._send(consts.MSG_REPLY, seq, self._box(res))
+            completed = token.complete() if token is not None else True
+            if token is not None:
+                self._remove_request_token(seq, token)
+            if completed:
+                self._dispatch_send(consts.MSG_REPLY, seq, self._box(res))
+            else:
+                self._dispatch_send(consts.MSG_EXCEPTION, seq, self._box_exc(
+                    AsyncResultCancelled, AsyncResultCancelled("request cancelled"), None))
+        finally:
+            if token is not None:
+                self._remove_request_token(seq, token)
+
+    def _enqueue_request(self, seq, raw_args):  # dispatch
+        token = CancellationToken()
+        with self._request_state_lock:
+            if self.closed:
+                return
+            self._request_tokens[seq] = token
+        try:
+            self._spawn_request(self._dispatch_request, seq, raw_args, token)
+        except Exception:
+            with self._request_state_lock:
+                self._request_tokens.pop(seq, None)
+            self._dispatch_request(seq, raw_args)
+
+    def _spawn_request(self, func, *args):
+        return spawn(func, *args)
+
+    def _dispatch_send(self, msg, seq, args):
+        try:
+            self._send(msg, seq, args)
+        except Exception:
+            if not self.closed:
+                raise
+
+    def _remove_request_token(self, seq, token):
+        with self._request_state_lock:
+            if self._request_tokens.get(seq) is token:
+                self._request_tokens.pop(seq)
 
     def _box_exc(self, typ, val, tb):  # dispatch?
         return vinegar.dump(typ, val, tb,
@@ -403,13 +463,31 @@ class Connection(object):
 
     def _dispatch(self, data):  # serving---dispatch?
         msg, = brine.I1.unpack(data[:1])  # unpack just msg to minimize time to release
-        if msg == consts.MSG_REQUEST:
+        if msg == consts.MSG_CANCEL:
+            if self._bind_threads:
+                self._get_thread()._occupation_count += 1
+            seq, original_seq = brine.load(data[1:])
+            self._handle_cancel(seq, original_seq)
+        elif msg == consts.MSG_CANCEL_ACK:
+            if self._bind_threads:
+                this_thread = self._get_thread()
+                this_thread._occupation_count -= 1
+                if this_thread._occupation_count == 0:
+                    this_thread._remote_thread_id = UNBOUND_THREAD_ID
+            seq, status = brine.load(data[1:])
+            self._seq_request_callback(msg, seq, False, status)
+        elif msg == consts.MSG_REQUEST:
             if self._bind_threads:
                 self._get_thread()._occupation_count += 1
             else:
                 self._recvlock.release()
             seq, args = brine.load(data[1:])
-            self._dispatch_request(seq, args)
+            if self._bind_threads:
+                self._dispatch_request(seq, args)
+            elif args[0] in (consts.HANDLE_CLOSE, consts.HANDLE_PROTOCOL):
+                self._dispatch_request(seq, args)
+            else:
+                self._enqueue_request(seq, args)
         else:
             if self._bind_threads:
                 this_thread = self._get_thread()
@@ -419,14 +497,14 @@ class Connection(object):
             if msg == consts.MSG_REPLY:
                 seq, args = brine.load(data[1:])
                 obj = self._unbox(args)
-                self._seq_request_callback(msg, seq, False, obj)
                 if not self._bind_threads:
                     self._recvlock.release()  # releasing here fixes race condition with AsyncResult.wait
+                self._seq_request_callback(msg, seq, False, obj)
             elif msg == consts.MSG_EXCEPTION:
-                if not self._bind_threads:
-                    self._recvlock.release()
                 seq, args = brine.load(data[1:])
                 obj = self._unbox_exc(args)
+                if not self._bind_threads:
+                    self._recvlock.release()
                 self._seq_request_callback(msg, seq, True, obj)
             else:
                 raise ValueError(f"invalid message type: {msg!r}")
@@ -745,7 +823,13 @@ class Connection(object):
 
     def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
         seq = self._get_seq_id()
+        return self._async_request_seq(seq, handler, args, callback)
+
+    def _register_request_callback(self, seq, callback):
         self._request_callbacks[seq] = callback
+
+    def _async_request_seq(self, seq, handler, args, callback):  # serving
+        self._register_request_callback(seq, callback)
         try:
             self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
         except Exception:
@@ -754,6 +838,7 @@ class Connection(object):
             # so, pop the callback and raise to keep response integrity is consistent
             self._request_callbacks.pop(seq, None)
             raise
+        return seq
 
     def async_request(self, handler, *args, **kwargs):  # serving
         """Send an asynchronous request (does not wait for it to finish)
@@ -764,11 +849,57 @@ class Connection(object):
         timeout = kwargs.pop("timeout", None)
         if kwargs:
             raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
-        res = AsyncResult(self)
-        self._async_request(handler, args, res)
+        seq = self._get_seq_id()
+        res = AsyncResult(self, seq)
+        self._async_request_seq(seq, handler, args, res)
         if timeout is not None:
             res.set_expiry(timeout)
         return res
+
+    def _probe_cancel_support(self):
+        if self._remote_cancel_supported is not None:
+            return
+        if self._bind_threads:
+            self._remote_cancel_supported = False
+            return
+
+        def handle_result(is_exc, obj):
+            self._remote_cancel_supported = not is_exc and obj == consts.PROTOCOL_CAPABILITY_CANCEL
+
+        self._remote_cancel_supported = None
+        self._async_request(consts.HANDLE_PROTOCOL, (consts.PROTOCOL_CAPABILITY_CANCEL,), handle_result)
+
+    def cancel_supported(self, timeout=None):
+        """Check whether the peer supports cooperative request cancellation."""
+        if self._remote_cancel_supported is None and not self.closed:
+            self._probe_cancel_support()
+        while self._remote_cancel_supported is None and not self.closed:
+            if not self.poll(timeout if timeout is not None else self._config["sync_request_timeout"]):
+                break
+        return bool(self._remote_cancel_supported)
+
+    def _cancel_request(self, original_seq, timeout=None):
+        if not self.cancel_supported(timeout):
+            return consts.CANCEL_UNSUPPORTED
+
+        wait_timeout = timeout if timeout is not None else self._config["sync_request_timeout"]
+        ack = AsyncResult(self)
+        ack.set_expiry(wait_timeout)
+
+        def handle_ack(is_exc, obj):
+            ack(is_exc, obj)
+
+        seq = self._get_seq_id()
+        self._register_request_callback(seq, handle_ack)
+        try:
+            self._send(consts.MSG_CANCEL, seq, original_seq)
+        except Exception:
+            self._request_callbacks.pop(seq, None)
+            raise
+        try:
+            return ack.value
+        finally:
+            self._request_callbacks.pop(seq, None)
 
     @property
     def root(self):  # serving
@@ -810,6 +941,7 @@ class Connection(object):
     def _request_handlers(cls):  # request handlers
         return {
             consts.HANDLE_PING: cls._handle_ping,
+            consts.HANDLE_PROTOCOL: cls._handle_protocol,
             consts.HANDLE_CLOSE: cls._handle_close,
             consts.HANDLE_GETROOT: cls._handle_getroot,
             consts.HANDLE_GETATTR: cls._handle_getattr,
@@ -833,6 +965,20 @@ class Connection(object):
 
     def _handle_ping(self, data):  # request handler
         return data
+
+    def _handle_protocol(self, capability):  # request handler
+        if capability == consts.PROTOCOL_CAPABILITY_CANCEL:
+            if self._bind_threads:
+                raise NotImplementedError("cancellation is unavailable when bind_threads is enabled")
+            return consts.PROTOCOL_CAPABILITY_CANCEL
+        raise NotImplementedError(f"unsupported protocol capability: {capability!r}")
+
+    def _handle_cancel(self, ack_seq, original_seq):  # protocol handler
+        with self._request_state_lock:
+            token = self._request_tokens.get(original_seq)
+            cancelled = token.cancel() if token is not None else False
+        status = consts.CANCEL_CANCELLED if cancelled else consts.CANCEL_COMPLETED
+        self._dispatch_send(consts.MSG_CANCEL_ACK, ack_seq, int(status))
 
     def _handle_close(self):  # request handler
         self._cleanup()
