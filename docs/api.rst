@@ -37,6 +37,7 @@ Protocol
 
    api/core_netref
    api/core_protocol
+   api/core_cancellation
    api/core_service
 
 
@@ -47,6 +48,8 @@ Protocol
 * :ref:`api-netref` - Implementation of transparent object proxies (netrefs)
 
 * :ref:`api-async` - Asynchronous object proxies (netrefs)
+
+* :ref:`api-cancellation` - Cooperative request cancellation tokens and statuses
 
 Server-Side
 -----------

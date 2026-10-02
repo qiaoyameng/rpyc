@@ -1,7 +1,20 @@
 import time  # noqa: F401
-from threading import Event
+from enum import Enum
+from threading import RLock
 from rpyc.lib import Timeout
 from rpyc.lib.compat import TimeoutError as AsyncResultTimeout
+
+
+class CancelledError(Exception):
+    """Raised when an asynchronous result was explicitly cancelled."""
+
+
+class CancelStatus(str, Enum):
+    """Result of requesting cancellation of an asynchronous operation."""
+
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    UNSUPPORTED = "unsupported"
 
 
 class AsyncResult(object):
@@ -9,18 +22,24 @@ class AsyncResult(object):
     will eventually have a result. Use the :attr:`value` property to access the
     result (which will block if the result has not yet arrived).
     """
-    __slots__ = ["_conn", "_is_ready", "_is_exc", "_callbacks", "_obj", "_ttl"]
+    __slots__ = ["_conn", "_seq", "_is_ready", "_is_exc", "_is_cancelled",
+                 "_callbacks", "_obj", "_ttl", "_lock"]
 
-    def __init__(self, conn):
+    def __init__(self, conn, seq=None):
         self._conn = conn
+        self._seq = seq
         self._is_ready = False
         self._is_exc = None
+        self._is_cancelled = False
         self._obj = None
         self._callbacks = []
         self._ttl = Timeout(None)
+        self._lock = RLock()
 
     def __repr__(self):
-        if self._is_ready:
+        if self._is_cancelled:
+            state = "cancelled"
+        elif self._is_ready:
             state = "ready"
         elif self._is_exc:
             state = "error"
@@ -31,14 +50,46 @@ class AsyncResult(object):
         return f"<AsyncResult object ({state}) at 0x{id(self):08x}>"
 
     def __call__(self, is_exc, obj):
-        if self.expired:
-            return
-        self._is_exc = is_exc
-        self._obj = obj
-        self._is_ready = True
-        for cb in self._callbacks:
+        with self._lock:
+            if self.expired:
+                return
+            if self._is_ready:
+                return
+            self._is_exc = is_exc
+            self._obj = obj
+            self._is_ready = True
+            callbacks = self._callbacks[:]
+            del self._callbacks[:]
+        for cb in callbacks:
             cb(self)
-        del self._callbacks[:]
+
+    def cancel(self):
+        """Requests cooperative cancellation of the remote operation.
+
+        This does not interrupt the server thread. A cancellation message is
+        acknowledged independently, and the running function can observe its
+        :class:`~rpyc.core.cancellation.CancellationToken`.
+        """
+        return self._conn._cancel_async_result(self)
+
+    def _claim_result(self):
+        with self._lock:
+            return not self._is_ready and not self.expired
+
+    def _set_cancelled(self):
+        with self._lock:
+            if self._is_ready:
+                return self._is_cancelled
+            exc = CancelledError("request cancelled")
+            self._is_cancelled = True
+            self._is_exc = True
+            self._obj = exc
+            self._is_ready = True
+            callbacks = self._callbacks[:]
+            del self._callbacks[:]
+        for cb in callbacks:
+            cb(self)
+        return True
 
     def wait(self):
         """Waits for the result to arrive. If the AsyncResult object has an
@@ -54,6 +105,11 @@ class AsyncResult(object):
         if not self._is_ready:
             raise AsyncResultTimeout("result expired")
 
+    @property
+    def cancelled(self):
+        """Indicates whether the result was explicitly cancelled."""
+        return self._is_cancelled
+
     def _waiting(self):
         return not (self._is_ready or self.expired)
 
@@ -65,10 +121,12 @@ class AsyncResult(object):
 
         :param func: the callback function to add
         """
-        if self._is_ready:
+        with self._lock:
+            ready = self._is_ready
+            if not ready:
+                self._callbacks.append(func)
+        if ready:
             func(self)
-        else:
-            self._callbacks.append(func)
 
     def set_expiry(self, timeout):
         """Sets the expiry time (in seconds, relative to now) or ``None`` for

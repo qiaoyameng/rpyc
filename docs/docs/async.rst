@@ -40,6 +40,40 @@ and get the result using ``res.value``. You may set a timeout for the result usi
 ``res.set_expiry()``, or even register a callback function to be invoked when the
 result arrives, using ``res.add_callback()``.
 
+Cancellation
+^^^^^^^^^^^
+A timeout only stops waiting locally; it does not tell the server that the result is no
+longer wanted. Call :meth:`~rpyc.core.async_.AsyncResult.cancel` to send an independent
+cancellation request::
+
+    result = myfunc_async()
+    status = result.cancel()
+
+The returned :class:`~rpyc.core.async_.CancelStatus` is the local terminal outcome of the
+cancel call:
+
+* ``CancelStatus.CANCELLED``: cancellation was acknowledged before completion. Subsequent
+  reads of ``result.value`` raise :class:`~rpyc.core.async_.CancelledError`.
+* ``CancelStatus.COMPLETED``: the original request had already committed its result. The
+  normal result remains available.
+* ``CancelStatus.UNSUPPORTED``: the peer does not implement the cancel capability or the
+  connection uses a request model on which cancellation is unavailable.
+
+Cancellation is cooperative. The server does not inject an exception into another thread.
+Queued requests can be skipped before they begin. A running function should observe
+:func:`~rpyc.core.cancellation.current_cancellation_token` and exit by itself::
+
+    import rpyc
+
+    def long_running_job():
+        token = rpyc.current_cancellation_token()
+        while more_work():
+            token.raise_if_cancelled()
+            do_one_unit_of_work()
+
+A late reply or exception for a cancelled result is discarded, callbacks are invoked at most
+once, and any references carried by that reply are released normally.
+
 Notes
 ^^^^^
 The returns async proxies are cached by a `weak-reference <https://docs.python.org/3/library/weakref.html>`_.
@@ -102,7 +136,6 @@ doing other things.
 
 For a detailed example show-casing the ``BgServingThread``, see :ref:`tut5-events` in the
 tutorial.
-
 
 
 

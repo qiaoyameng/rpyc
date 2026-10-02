@@ -16,12 +16,59 @@ from rpyc.lib import spawn, Timeout, get_methods, get_id_pack, hasattr_static
 from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # noqa: F401
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
 from rpyc.core import consts, brine, vinegar, netref
-from rpyc.core.async_ import AsyncResult
+from rpyc.core.async_ import AsyncResult, CancelStatus
+from rpyc.core.cancellation import (CancellationToken, _set_current_cancellation_token,
+                                    _reset_current_cancellation_token, _executing_server_request)
 
 
 class PingError(Exception):
     """The exception raised should :func:`Connection.ping` fail"""
     pass
+
+
+class _ServerRequest:
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+    __slots__ = ["seq", "raw_args", "state", "token", "lock"]
+
+    def __init__(self, seq, raw_args):
+        self.seq = seq
+        self.raw_args = raw_args
+        self.state = self.PENDING
+        self.token = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        with self.lock:
+            if self.state == self.CANCELLED:
+                return False
+            self.state = self.RUNNING
+            self.token = CancellationToken(self.seq)
+            return self.token
+
+    def cancel(self):
+        with self.lock:
+            if self.state == self.COMPLETED:
+                return consts.CANCEL_ALREADY_COMPLETED
+            if self.state == self.CANCELLED:
+                return consts.CANCEL_REQUESTED
+            was_pending = self.state == self.PENDING
+            self.state = self.CANCELLED
+            token = self.token
+        if token is not None:
+            token._cancel()
+        return consts.CANCEL_SKIPPED if was_pending else consts.CANCEL_REQUESTED
+
+    def commit(self, send):
+        with self.lock:
+            if self.state == self.CANCELLED:
+                return False
+            self.state = self.COMPLETED
+            send()
+            return True
 
 
 UNBOUND_THREAD_ID = 0  # Used when the message is being sent but the thread is not bound yet.
@@ -164,12 +211,19 @@ class Connection(object):
         self._sendlock = Lock()
         self._recv_event = Condition()  # TODO: why not simply timeout? why not associate w/ recvlock? explain/redesign
         self._request_callbacks = {}
+        self._cancel_callbacks = {}
         self._local_objects = RefCountingColl()
         self._last_traceback = None
         self._proxy_cache = WeakValueDict()
         self._netref_classes_cache = {}
         self._remote_root = None
         self._send_queue = []
+        self._peer_cancel_capability = None
+        self._server_requests = {}
+        self._server_requests_lock = Lock()
+        self._server_request_queue = collections.deque()
+        self._server_request_queue_condition = Condition(Lock())
+        self._server_request_worker_started = False
         self._local_root = root
         self._closed = False
         # Settings for bind_threads
@@ -199,9 +253,18 @@ class Connection(object):
         if self._closed and not _anyway:
             return
         self._closed = True
+        with self._server_requests_lock:
+            requests = list(self._server_requests.values())
+        for request in requests:
+            request.cancel()
+        with self._server_request_queue_condition:
+            self._server_request_queue_condition.notify_all()
         self._channel.close()
-        self._local_root.on_disconnect(self)
+        if self._local_root is not None:
+            self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
+        self._cancel_callbacks.clear()
+        self._server_requests.clear()
         self._local_objects.clear()
         self._proxy_cache.clear()
         self._netref_classes_cache.clear()
@@ -309,6 +372,12 @@ class Connection(object):
             finally:
                 self._sendlock.release()
 
+    def _send_now(self, msg, seq, args):
+        assert not self._bind_threads
+        data = brine.I1.pack(msg) + brine.dump((seq, args))
+        with self._sendlock:
+            self._channel.send(data)
+
     def _box(self, obj):  # boxing
         """store a local object in such a way that it could be recreated on
         the remote party either by-value or by-reference"""
@@ -363,13 +432,84 @@ class Connection(object):
         return cls(self, id_pack)
 
     def _dispatch_request(self, seq, raw_args):  # dispatch
+        if self._bind_threads or _executing_server_request.get():
+            self._execute_request(seq, raw_args)
+            return
+
+        handler = raw_args[0]
+        if handler in self._inline_request_handlers():
+            self._execute_request(seq, raw_args)
+            return
+
+        request = _ServerRequest(seq, raw_args)
+        with self._server_requests_lock:
+            self._server_requests[seq] = request
+        self._ensure_server_request_worker()
+        with self._server_request_queue_condition:
+            self._server_request_queue.append(request)
+            self._server_request_queue_condition.notify()
+
+    @classmethod
+    def _inline_request_handlers(cls):
+        return frozenset((
+            consts.HANDLE_PING,
+            consts.HANDLE_CLOSE,
+            consts.HANDLE_DEL,
+            consts.HANDLE_HANDSHAKE,
+        ))
+
+    def _ensure_server_request_worker(self):
+        with self._server_requests_lock:
+            if self._server_request_worker_started:
+                return
+            self._server_request_worker_started = True
+        spawn(self._serve_server_requests)
+
+    def _serve_server_requests(self):
+        while not self.closed:
+            request = None
+            with self._server_request_queue_condition:
+                while not self._server_request_queue and not self.closed:
+                    self._server_request_queue_condition.wait()
+                if not self._server_request_queue:
+                    break
+                request = self._server_request_queue.popleft()
+                token = request.start()
+            if token is False:
+                self._release_peer_refs(request.raw_args[1])
+                with self._server_requests_lock:
+                    self._server_requests.pop(request.seq, None)
+                continue
+            self._execute_queued_request(request, token)
+
+    def _execute_queued_request(self, request, token):
+        token_context = _set_current_cancellation_token(token)
+        executing_context = _executing_server_request.set(True)
+        try:
+            self._execute_request(request.seq, request.raw_args, request)
+        finally:
+            _reset_current_cancellation_token(token_context)
+            _executing_server_request.reset(executing_context)
+            with self._server_requests_lock:
+                self._server_requests.pop(request.seq, None)
+
+    def _execute_request(self, seq, raw_args, request=None):  # dispatch
         try:
             handler, args = raw_args
             args = self._unbox(args)
             res = self._HANDLERS[handler](self, *args)
+            package = self._box(res)
+            if request is not None and not request.commit(
+                    lambda: self._send(consts.MSG_REPLY, seq, package)):
+                self._discard_local_boxed_package(package)
+                return
         except:  # TODO: revisit how to catch handle locally, this should simplify when py2 is dropped
             # need to catch old style exceptions too
             t, v, tb = sys.exc_info()
+            if request is not None:
+                package = self._box_exc(t, v, tb)
+                if not request.commit(lambda: self._send(consts.MSG_EXCEPTION, seq, package)):
+                    return
             self._last_traceback = tb
             logger = self._config["logger"]
             if logger and t is not StopIteration:
@@ -378,9 +518,79 @@ class Connection(object):
                 raise
             if t is KeyboardInterrupt and self._config["propagate_KeyboardInterrupt_locally"]:
                 raise
-            self._send(consts.MSG_EXCEPTION, seq, self._box_exc(t, v, tb))
+            if request is None:
+                self._send(consts.MSG_EXCEPTION, seq, self._box_exc(t, v, tb))
         else:
-            self._send(consts.MSG_REPLY, seq, self._box(res))
+            if request is None:
+                self._send(consts.MSG_REPLY, seq, package)
+
+    def _release_peer_refs(self, package):
+        if self.closed:
+            return
+        label, value = package
+        if label == consts.LABEL_TUPLE:
+            for item in value:
+                self._release_peer_refs(item)
+        elif label == consts.LABEL_REMOTE_REF:
+            self._send_decref(value)
+
+    def _discard_boxed_package(self, package):
+        if self.closed:
+            return
+        label, value = package
+        if label == consts.LABEL_TUPLE:
+            for item in value:
+                self._discard_boxed_package(item)
+        elif label == consts.LABEL_REMOTE_REF:
+            self._send_decref(value)
+
+    def _discard_local_boxed_package(self, package):
+        label, value = package
+        if label == consts.LABEL_TUPLE:
+            for item in value:
+                self._discard_local_boxed_package(item)
+        elif label == consts.LABEL_REMOTE_REF:
+            self._local_objects.decref(value)
+
+    def _send_decref(self, id_pack=None, count=1):
+        if self.closed:
+            return
+        args = (
+            (consts.LABEL_LOCAL_REF, id_pack),
+            (consts.LABEL_VALUE, count),
+        )
+        seq = self._get_seq_id()
+        self._request_callbacks[seq] = lambda is_exc, obj: None
+        self._send_now(consts.MSG_REQUEST, seq,
+                       (consts.HANDLE_DEL, (consts.LABEL_TUPLE, args)))
+
+    def _handle_handshake(self, capabilities):
+        supported = 0
+        if capabilities & consts.CAP_CANCEL_REQUEST and not self._bind_threads:
+            supported |= consts.CAP_CANCEL_REQUEST
+        return supported
+
+    def _handle_cancel_request(self, seq):
+        with self._server_requests_lock:
+            request = self._server_requests.get(seq)
+        if request is None:
+            status = consts.CANCEL_ALREADY_COMPLETED
+        else:
+            status = request.cancel()
+            if status == consts.CANCEL_SKIPPED:
+                raw_args = None
+                with self._server_request_queue_condition:
+                    try:
+                        self._server_request_queue.remove(request)
+                    except ValueError:
+                        pass
+                    else:
+                        raw_args = request.raw_args
+                if raw_args is not None:
+                    self._release_peer_refs(raw_args[1])
+                    with self._server_requests_lock:
+                        self._server_requests.pop(seq, None)
+        return seq, status
 
     def _box_exc(self, typ, val, tb):  # dispatch?
         return vinegar.dump(typ, val, tb,
@@ -393,13 +603,14 @@ class Connection(object):
                             instantiate_custom_exceptions=self._config["instantiate_custom_exceptions"],
                             instantiate_oldstyle_exceptions=self._config["instantiate_oldstyle_exceptions"])
 
-    def _seq_request_callback(self, msg, seq, is_exc, obj):
-        _callback = self._request_callbacks.pop(seq, None)
-        if _callback is not None:
-            _callback(is_exc, obj)
-        elif self._config["logger"] is not None:
-            debug_msg = 'Recieved {} seq {} and a related request callback did not exist'
-            self._config["logger"].debug(debug_msg.format(msg, seq))
+    def _seq_request_pop(self, seq):
+        return self._request_callbacks.pop(seq, None)
+
+    def _seq_deliver_callback(self, callback):
+        if callback is None:
+            return False
+        claim = getattr(callback, "_claim_result", None)
+        return True if claim is None else claim()
 
     def _dispatch(self, data):  # serving---dispatch?
         msg, = brine.I1.unpack(data[:1])  # unpack just msg to minimize time to release
@@ -408,8 +619,23 @@ class Connection(object):
                 self._get_thread()._occupation_count += 1
             else:
                 self._recvlock.release()
+            seq, raw_args = brine.load(data[1:])
+            self._dispatch_request(seq, raw_args)
+        elif msg == consts.MSG_CANCEL:
+            if self._bind_threads:
+                raise ValueError("cancel protocol is not available with bound threads")
+            self._recvlock.release()
+            seq = brine.load(data[1:])[0]
+            self._send(consts.MSG_CANCEL_ACK, seq, self._box(self._handle_cancel_request(seq)))
+        elif msg == consts.MSG_CANCEL_ACK:
+            if self._bind_threads:
+                raise ValueError("cancel protocol is not available with bound threads")
+            self._recvlock.release()
             seq, args = brine.load(data[1:])
-            self._dispatch_request(seq, args)
+            obj = self._unbox(args)
+            callback = self._cancel_callbacks.pop(seq, None)
+            if callback is not None:
+                callback(False, obj)
         else:
             if self._bind_threads:
                 this_thread = self._get_thread()
@@ -418,16 +644,23 @@ class Connection(object):
                     this_thread._remote_thread_id = UNBOUND_THREAD_ID
             if msg == consts.MSG_REPLY:
                 seq, args = brine.load(data[1:])
-                obj = self._unbox(args)
-                self._seq_request_callback(msg, seq, False, obj)
+                callback = self._seq_request_pop(seq)
+                if self._seq_deliver_callback(callback):
+                    obj = self._unbox(args)
+                    callback(False, obj)
+                else:
+                    self._discard_boxed_package(args)
                 if not self._bind_threads:
                     self._recvlock.release()  # releasing here fixes race condition with AsyncResult.wait
             elif msg == consts.MSG_EXCEPTION:
+                seq, args = brine.load(data[1:])
+                callback = self._seq_request_pop(seq)
+                should_deliver = self._seq_deliver_callback(callback)
                 if not self._bind_threads:
                     self._recvlock.release()
-                seq, args = brine.load(data[1:])
-                obj = self._unbox_exc(args)
-                self._seq_request_callback(msg, seq, True, obj)
+                if should_deliver:
+                    obj = self._unbox_exc(args)
+                    callback(True, obj)
             else:
                 raise ValueError(f"invalid message type: {msg!r}")
 
@@ -743,11 +976,13 @@ class Connection(object):
         # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
         return _async_res.value
 
-    def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
+    def _async_request(self, handler, args=(), callback=(lambda a, b: None),
+                       _raw_args=None):  # serving
         seq = self._get_seq_id()
         self._request_callbacks[seq] = callback
         try:
-            self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
+            raw_args = self._box(args) if _raw_args is None else _raw_args
+            self._send(consts.MSG_REQUEST, seq, (handler, raw_args))
         except Exception:
             # TODO: review test_remote_exception, logging exceptions show attempt to write on closed stream
             # depending on the case, the MSG_REQUEST may or may not have been sent completely
@@ -764,11 +999,58 @@ class Connection(object):
         timeout = kwargs.pop("timeout", None)
         if kwargs:
             raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
-        res = AsyncResult(self)
-        self._async_request(handler, args, res)
+        seq = self._get_seq_id()
+        res = AsyncResult(self, seq)
+        self._request_callbacks[seq] = res
+        try:
+            self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
+        except Exception:
+            self._request_callbacks.pop(seq, None)
+            raise
         if timeout is not None:
             res.set_expiry(timeout)
         return res
+
+    def _peer_supports_cancel(self):
+        if self._peer_cancel_capability is not None:
+            return bool(self._peer_cancel_capability & consts.CAP_CANCEL_REQUEST)
+        try:
+            capabilities = self.async_request(
+                consts.HANDLE_HANDSHAKE, consts.CAP_CANCEL_REQUEST, timeout=1
+            ).value
+        except Exception:
+            capabilities = 0
+        self._peer_cancel_capability = capabilities
+        return bool(capabilities & consts.CAP_CANCEL_REQUEST)
+
+    def _cancel_async_result(self, result):
+        if result._conn is not self or result._seq is None:
+            return CancelStatus.UNSUPPORTED
+        with result._lock:
+            if result._is_cancelled:
+                return CancelStatus.CANCELLED
+            if result._is_ready:
+                return CancelStatus.COMPLETED
+        if self._bind_threads or not self._peer_supports_cancel():
+            return CancelStatus.UNSUPPORTED
+
+        ack = AsyncResult(self)
+        self._cancel_callbacks[result._seq] = ack
+        try:
+            self._send(consts.MSG_CANCEL, result._seq, None)
+        except Exception:
+            self._cancel_callbacks.pop(result._seq, None)
+            return CancelStatus.UNSUPPORTED
+        try:
+            _, status = ack.value
+        except Exception:
+            self._cancel_callbacks.pop(result._seq, None)
+            raise
+
+        if status == consts.CANCEL_ALREADY_COMPLETED:
+            return CancelStatus.COMPLETED
+        result._set_cancelled()
+        return CancelStatus.CANCELLED
 
     @property
     def root(self):  # serving
@@ -829,6 +1111,7 @@ class Connection(object):
             consts.HANDLE_BUFFITER: cls._handle_buffiter,
             consts.HANDLE_OLDSLICING: cls._handle_oldslicing,
             consts.HANDLE_CTXEXIT: cls._handle_ctxexit,
+            consts.HANDLE_HANDSHAKE: cls._handle_handshake,
         }
 
     def _handle_ping(self, data):  # request handler
@@ -841,7 +1124,8 @@ class Connection(object):
         return self._local_root
 
     def _handle_del(self, obj, count=1):  # request handler
-        self._local_objects.decref(get_id_pack(obj), count)
+        id_pack = obj if isinstance(obj, tuple) else get_id_pack(obj)
+        self._local_objects.decref(id_pack, count)
 
     def _handle_repr(self, obj):  # request handler
         return repr(obj)

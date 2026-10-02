@@ -98,8 +98,10 @@ class RefCountingColl(object):
 
     def decref(self, key, count=1):
         with self._lock:
-            slot = self._dict[key]
-            if slot[1] < count:
+            slot = self._dict.get(key)
+            if slot is None:
+                return
+            if slot[1] <= count:
                 del self._dict[key]
             else:
                 slot[1] -= count
