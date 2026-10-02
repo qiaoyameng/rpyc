@@ -1,6 +1,6 @@
-import time  # noqa: F401
 from threading import Event
 from rpyc.lib import Timeout
+from rpyc.core.deadline import Deadline
 from rpyc.lib.compat import TimeoutError as AsyncResultTimeout
 
 
@@ -9,15 +9,17 @@ class AsyncResult(object):
     will eventually have a result. Use the :attr:`value` property to access the
     result (which will block if the result has not yet arrived).
     """
-    __slots__ = ["_conn", "_is_ready", "_is_exc", "_callbacks", "_obj", "_ttl"]
+    __slots__ = ["_conn", "_seq", "_is_ready", "_is_exc", "_callbacks", "_obj", "_ttl", "_delivered"]
 
     def __init__(self, conn):
         self._conn = conn
+        self._seq = None
         self._is_ready = False
         self._is_exc = None
         self._obj = None
         self._callbacks = []
         self._ttl = Timeout(None)
+        self._delivered = False
 
     def __repr__(self):
         if self._is_ready:
@@ -31,6 +33,9 @@ class AsyncResult(object):
         return f"<AsyncResult object ({state}) at 0x{id(self):08x}>"
 
     def __call__(self, is_exc, obj):
+        if self._delivered:
+            return
+        self._delivered = True
         if self.expired:
             return
         self._is_exc = is_exc
@@ -44,13 +49,20 @@ class AsyncResult(object):
         """Waits for the result to arrive. If the AsyncResult object has an
         expiry set, and the result did not arrive within that timeout,
         an :class:`AsyncResultTimeout` exception is raised"""
-        while self._waiting():
-            # Serve the connection since we are not ready. Suppose
-            # the reply for our seq is served. The callback is this class
-            # so __call__ sets our obj and _is_ready to true.
-            self._conn.serve(self._ttl, waiting=self._waiting)
+        try:
+            while self._waiting():
+                # Serve the connection since we are not ready. Suppose
+                # the reply for our seq is served. The callback is this class
+                # so __call__ sets our obj and _is_ready to true.
+                self._conn.serve(self._ttl, waiting=lambda: not self._is_ready)
+                if not self._is_ready and self.expired:
+                    break
+        finally:
+            timed_out = not self._is_ready and self._ttl.finite
+            if timed_out and self._seq is not None:
+                if self._conn._request_callbacks.pop(self._seq, None) is not None:
+                    self._conn._orphan_requests.add(self._seq)
 
-        # Check if we timed out before result was ready
         if not self._is_ready:
             raise AsyncResultTimeout("result expired")
 
@@ -76,7 +88,7 @@ class AsyncResult(object):
 
         :param timeout: the expiry time in seconds or ``None``
         """
-        self._ttl = Timeout(timeout)
+        self._ttl = timeout if isinstance(timeout, (Timeout, Deadline)) else Timeout(timeout)
 
     @property
     def ready(self):

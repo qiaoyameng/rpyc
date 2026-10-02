@@ -9,6 +9,7 @@ import threading
 import time
 import random
 from rpyc.lib.compat import maxint  # noqa: F401
+from rpyc.core.deadline import Deadline
 
 
 SPAWN_THREAD_PREFIX = 'RpycSpawnThread'
@@ -117,19 +118,21 @@ def spawn_waitready(init, main):
 
 class Timeout(object):
 
-    def __init__(self, timeout):
-        if isinstance(timeout, Timeout):
+    def __init__(self, timeout, clock=time.monotonic):
+        if isinstance(timeout, (Timeout, Deadline)):
             self.finite = timeout.finite
-            self.tmax = timeout.tmax
+            self.tmax = timeout.tmax if isinstance(timeout, Timeout) else timeout.deadline
+            self.clock = timeout.clock
         else:
+            self.clock = clock
             self.finite = timeout is not None and timeout >= 0
-            self.tmax = time.time() + timeout if self.finite else None
+            self.tmax = self.clock() + timeout if self.finite else None
 
     def expired(self):
-        return self.finite and time.time() >= self.tmax
+        return self.finite and self.clock() >= self.tmax
 
     def timeleft(self):
-        return max((0, self.tmax - time.time())) if self.finite else None
+        return max((0, self.tmax - self.clock())) if self.finite else None
 
     def sleep(self, interval):
         time.sleep(min(interval, self.timeleft()) if self.finite else interval)

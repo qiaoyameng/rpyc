@@ -10,6 +10,7 @@ import collections
 import concurrent.futures as c_futures
 import os
 import threading
+from contextlib import contextmanager
 
 from threading import Lock, Condition, RLock
 from rpyc.lib import spawn, Timeout, get_methods, get_id_pack, hasattr_static
@@ -17,6 +18,16 @@ from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # 
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
 from rpyc.core import consts, brine, vinegar, netref
 from rpyc.core.async_ import AsyncResult
+from rpyc.core.deadline import (
+    Deadline,
+    DeadlinePropagationNotSupportedError,
+    current_clock,
+    current_deadline,
+    deadline_budget,
+    pop_deadline,
+    push_deadline,
+    push_none_deadline,
+)
 
 
 class PingError(Exception):
@@ -66,6 +77,8 @@ DEFAULT_CONFIG = dict(
     endpoints=None,
     logger=None,
     sync_request_timeout=30,
+    monotonic_clock=time.monotonic,
+    propagate_deadline_budget=True,
     before_closed=None,
     close_catchall=False,
     bind_threads=os.environ.get('RPYC_BIND_THREADS') == 'true',
@@ -126,6 +139,8 @@ Parameter                                Default value     Description
                                                            do no have this configuration option set.
 
 ``sync_request_timeout``                 ``30``            Default timeout for waiting results
+``propagate_deadline_budget``            ``True``          Negotiate call-chain deadline propagation
+``monotonic_clock``                      ``time.monotonic`` Clock used for local deadline calculations
 ``bind_threads``                         ``False``         Whether to restrict request/reply by thread (experimental).
                                                            The default value is False. Setting the environment variable
                                                            `RPYC_BIND_THREADS` to `"true"` will enable this feature.
@@ -154,6 +169,8 @@ class Connection(object):
         self._closed = True
         self._config = DEFAULT_CONFIG.copy()
         self._config.update(config)
+        if "monotonic_clock" not in config:
+            self._config["monotonic_clock"] = current_clock()
         if self._config["connid"] is None:
             self._config["connid"] = f"conn{next(_connection_id_generator)}"
 
@@ -164,6 +181,7 @@ class Connection(object):
         self._sendlock = Lock()
         self._recv_event = Condition()  # TODO: why not simply timeout? why not associate w/ recvlock? explain/redesign
         self._request_callbacks = {}
+        self._orphan_requests = set()
         self._local_objects = RefCountingColl()
         self._last_traceback = None
         self._proxy_cache = WeakValueDict()
@@ -172,6 +190,9 @@ class Connection(object):
         self._send_queue = []
         self._local_root = root
         self._closed = False
+        self._handshake_lock = RLock()
+        self._local_capabilities = self._local_capabilities()
+        self._remote_capabilities = None
         # Settings for bind_threads
         self._bind_threads = self._config['bind_threads']
         self._threads = None
@@ -202,6 +223,7 @@ class Connection(object):
         self._channel.close()
         self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
+        self._orphan_requests.clear()
         self._local_objects.clear()
         self._proxy_cache.clear()
         self._netref_classes_cache.clear()
@@ -232,7 +254,7 @@ class Connection(object):
             if self._config.get("before_closed"):
                 self._config["before_closed"](self.root)
             # TODO: define invariants/expectations around close sequence and timing
-            self.sync_request(consts.HANDLE_CLOSE)
+            self._async_request(consts.HANDLE_CLOSE, (), AsyncResult(self))
         except (EOFError, TimeoutError):
             pass
         except Exception:
@@ -265,12 +287,117 @@ class Connection(object):
         res = self.async_request(consts.HANDLE_PING, data, timeout=timeout)
         if res.value != data:
             raise PingError("echo mismatches sent data")
+        return res.value
+
+    @property
+    def deadline_budget_supported(self):
+        """Whether the peer negotiated call-chain deadline propagation.
+
+        Legacy peers remain usable for ordinary RPC. When this is ``False``,
+        entering :meth:`deadline_budget` raises
+        :class:`DeadlinePropagationNotSupportedError` rather than silently
+        treating per-request timeouts as an end-to-end deadline.
+        """
+        return self._remote_capabilities is not None and self._deadline_capability_negotiated()
+
+    @property
+    def current_deadline_budget(self):
+        """Remaining budget for the request currently executing on this thread."""
+        deadline = current_deadline()
+        return None if deadline is None else deadline.timeleft()
+
+    @contextmanager
+    def deadline_budget(self, budget):
+        """Run client code with a remaining call-chain deadline budget.
+
+        Outbound requests carry a relative remaining budget; each peer builds
+        a local deadline from its own monotonic clock, so different clock
+        origins do not affect correctness.
+        """
+        self._negotiate_capabilities()
+        if not self._deadline_capability_negotiated():
+            raise DeadlinePropagationNotSupportedError(
+                "the remote endpoint does not support deadline-budget propagation"
+            )
+        with deadline_budget(budget, clock=self._clock()):
+            yield
+
+    def _clock(self):
+        return self._config["monotonic_clock"]
+
+    def _local_capabilities(self):
+        capabilities = 0
+        if self._config["propagate_deadline_budget"]:
+            capabilities |= consts.CAPABILITY_DEADLINE_BUDGET
+        return capabilities
+
+    def _deadline_capability_negotiated(self):
+        return bool(
+            self._local_capabilities
+            and self._remote_capabilities is not None
+            and self._local_capabilities & self._remote_capabilities & consts.CAPABILITY_DEADLINE_BUDGET
+        )
+
+    def _negotiate_capabilities(self):
+        with self._handshake_lock:
+            if self._remote_capabilities is not None:
+                return
+            res = AsyncResult(self)
+            seq = self._async_request(
+                consts.HANDLE_HANDSHAKE,
+                (self._local_capabilities,),
+                res,
+            )
+            res._seq = seq
+            res.set_expiry(self._config["sync_request_timeout"])
+            try:
+                remote_capabilities = res.value
+            except KeyError:
+                remote_capabilities = 0
+            try:
+                self._remote_capabilities = int(remote_capabilities)
+            except (TypeError, ValueError):
+                self._remote_capabilities = 0
+            self._request_callbacks.pop(seq, None)
+
+    def _effective_deadline(self, timeout, inherited):
+        if timeout is None:
+            return inherited
+        if isinstance(timeout, Deadline):
+            explicit = timeout
+        elif isinstance(timeout, Timeout):
+            explicit = Deadline(deadline=timeout.tmax, clock=timeout.clock)
+        else:
+            explicit = Deadline(timeout, clock=self._clock())
+        if inherited is None:
+            return explicit
+        if not explicit.finite:
+            return inherited
+        return inherited if inherited.timeleft() <= explicit.timeleft() else explicit
+
+    def _outbound_deadline_budget(self, timeout):
+        inherited = current_deadline()
+        deadline = self._effective_deadline(timeout, inherited)
+        if deadline is not None and deadline.expired():
+            raise TimeoutError("deadline expired before request was sent")
+        if inherited is None:
+            return deadline, None
+        self._negotiate_capabilities()
+        if not self._deadline_capability_negotiated():
+            raise DeadlinePropagationNotSupportedError(
+                "the remote endpoint does not support deadline-budget propagation"
+            )
+        return deadline, deadline.timeleft()
 
     def _get_seq_id(self):  # IO
-        return next(self._seqcounter)
+        while True:
+            seq = next(self._seqcounter)
+            if seq not in self._request_callbacks and seq not in self._orphan_requests:
+                return seq
 
-    def _send(self, msg, seq, args):  # IO
-        data = brine.I1.pack(msg) + brine.dump((seq, args))  # see _dispatch
+    def _send(self, msg, seq, args, deadline_budget=None):  # IO
+        packet = (seq, args) if deadline_budget is None else (seq, args, deadline_budget)
+        data = brine.I1.pack(msg) + brine.dump(packet)  # see _dispatch
         if self._bind_threads:
             this_thread = self._get_thread()
             data = brine.I8I8.pack(this_thread.id, this_thread._remote_thread_id) + data
@@ -296,18 +423,17 @@ class Connection(object):
                 # Another thread holds the lock. It will send the data after
                 # it's done with its current job. We can safely return.
                 return
-            try:
-                # Can happen if another consumer was scheduled in between
-                # `while` and `acquire`:
-                if not self._send_queue:
-                    # Must `continue` to ensure that `send_queue` is checked
-                    # after releasing the lock! (in case another producer is
-                    # scheduled before `release`)
-                    continue
-                data = self._send_queue.pop(0)
-                self._channel.send(data)
-            finally:
+            # Can happen if another consumer was scheduled in between
+            # `while` and `acquire`:
+            if not self._send_queue:
+                # Must `continue` to ensure that `send_queue` is checked
+                # after releasing the lock! (in case another producer is
+                # scheduled before `release`)
                 self._sendlock.release()
+                continue
+            data = self._send_queue.pop(0)
+            self._sendlock.release()
+            self._channel.send(data)
 
     def _box(self, obj):  # boxing
         """store a local object in such a way that it could be recreated on
@@ -362,8 +488,23 @@ class Connection(object):
                 self._netref_classes_cache[id_pack] = cls
         return cls(self, id_pack)
 
-    def _dispatch_request(self, seq, raw_args):  # dispatch
+    def _dispatch_request(self, seq, raw_args, budget=None):  # dispatch
+        is_handshake = raw_args[0] == consts.HANDLE_HANDSHAKE
+        previous_deadline = current_deadline()
+        deadline = None
+        manage_deadline = False
+        if budget is not None:
+            deadline = Deadline(budget, clock=self._clock())
+            if previous_deadline is not None:
+                deadline = previous_deadline if previous_deadline.timeleft() <= deadline.timeleft() else deadline
+            push_deadline(deadline)
+            manage_deadline = True
+        elif not is_handshake and previous_deadline is not None:
+            push_none_deadline()
+            manage_deadline = True
         try:
+            if deadline is not None and deadline.expired():
+                raise TimeoutError("deadline expired before request dispatch")
             handler, args = raw_args
             args = self._unbox(args)
             res = self._HANDLERS[handler](self, *args)
@@ -381,6 +522,9 @@ class Connection(object):
             self._send(consts.MSG_EXCEPTION, seq, self._box_exc(t, v, tb))
         else:
             self._send(consts.MSG_REPLY, seq, self._box(res))
+        finally:
+            if manage_deadline:
+                pop_deadline()
 
     def _box_exc(self, typ, val, tb):  # dispatch?
         return vinegar.dump(typ, val, tb,
@@ -396,7 +540,11 @@ class Connection(object):
     def _seq_request_callback(self, msg, seq, is_exc, obj):
         _callback = self._request_callbacks.pop(seq, None)
         if _callback is not None:
-            _callback(is_exc, obj)
+            self._orphan_requests.discard(seq)
+            if not getattr(_callback, "expired", False):
+                _callback(is_exc, obj)
+        elif seq in self._orphan_requests:
+            self._orphan_requests.discard(seq)
         elif self._config["logger"] is not None:
             debug_msg = 'Recieved {} seq {} and a related request callback did not exist'
             self._config["logger"].debug(debug_msg.format(msg, seq))
@@ -408,8 +556,10 @@ class Connection(object):
                 self._get_thread()._occupation_count += 1
             else:
                 self._recvlock.release()
-            seq, args = brine.load(data[1:])
-            self._dispatch_request(seq, args)
+            packet = brine.load(data[1:])
+            seq, args = packet[0], packet[1]
+            budget = packet[2] if len(packet) == 3 else None
+            self._dispatch_request(seq, args, budget)
         else:
             if self._bind_threads:
                 this_thread = self._get_thread()
@@ -731,29 +881,37 @@ class Connection(object):
             pass
         return at_least_once
 
-    def sync_request(self, handler, *args):
+    def sync_request(self, handler, *args, timeout=None):
         """requests, sends a synchronous request (waits for the reply to arrive)
 
         :raises: any exception that the requests may be generated
         :returns: the result of the request
         """
-        timeout = self._config["sync_request_timeout"]
+        if timeout is None:
+            timeout = self._config["sync_request_timeout"]
         _async_res = self.async_request(handler, *args, timeout=timeout)
         # _async_res is an instance of AsyncResult, the value property invokes Connection.serve via AsyncResult.wait
         # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
         return _async_res.value
 
-    def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
+    def _async_request(self, handler, args=(), callback=(lambda a, b: None), deadline_budget=None):  # serving
         seq = self._get_seq_id()
+        boxed_args = self._box(args)
         self._request_callbacks[seq] = callback
         try:
-            self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
+            self._send(
+                consts.MSG_REQUEST,
+                seq,
+                (handler, boxed_args),
+                deadline_budget=deadline_budget,
+            )
         except Exception:
             # TODO: review test_remote_exception, logging exceptions show attempt to write on closed stream
             # depending on the case, the MSG_REQUEST may or may not have been sent completely
             # so, pop the callback and raise to keep response integrity is consistent
             self._request_callbacks.pop(seq, None)
             raise
+        return seq
 
     def async_request(self, handler, *args, **kwargs):  # serving
         """Send an asynchronous request (does not wait for it to finish)
@@ -764,11 +922,20 @@ class Connection(object):
         timeout = kwargs.pop("timeout", None)
         if kwargs:
             raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
+        self._drain_orphan_replies()
         res = AsyncResult(self)
-        self._async_request(handler, args, res)
-        if timeout is not None:
-            res.set_expiry(timeout)
+        if self._local_capabilities:
+            self._negotiate_capabilities()
+        deadline, budget = self._outbound_deadline_budget(timeout)
+        seq = self._async_request(handler, args, res, deadline_budget=budget)
+        res._seq = seq
+        if deadline is not None:
+            res.set_expiry(deadline)
         return res
+
+    def _drain_orphan_replies(self):
+        while self.serve(0, wait_for_lock=False):
+            pass
 
     @property
     def root(self):  # serving
@@ -829,10 +996,15 @@ class Connection(object):
             consts.HANDLE_BUFFITER: cls._handle_buffiter,
             consts.HANDLE_OLDSLICING: cls._handle_oldslicing,
             consts.HANDLE_CTXEXIT: cls._handle_ctxexit,
-        }
+            consts.HANDLE_HANDSHAKE: cls._handle_handshake,
+         }
 
     def _handle_ping(self, data):  # request handler
         return data
+
+    def _handle_handshake(self, remote_capabilities=None):  # request handler
+        self._remote_capabilities = self._local_capabilities
+        return self._local_capabilities
 
     def _handle_close(self):  # request handler
         self._cleanup()
