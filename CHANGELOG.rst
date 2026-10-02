@@ -1,3 +1,19 @@
+Unreleased
+==========
+
+- Added a structured remote exception tree format (``rpyc.core.vinegar.dump_tree``)
+  that preserves ``ExceptionGroup`` hierarchies, ``__notes__`` and
+  ``__cause__``/``__context__`` relations (including shared references and
+  cycles, encoded as node references). The format only carries brine-safe data,
+  honors the existing custom-exception import/instantiation policy, degrades
+  unknown types to generic exceptions named after the remote type, and enforces
+  node/depth/text limits with explicit truncation markers. It is enabled per
+  connection through capability negotiation (``HANDLE_GETCAPS``); peers that do
+  not support it keep receiving the legacy format. Controlled by the new
+  ``enable_exception_trees``, ``exception_tree_max_nodes``,
+  ``exception_tree_max_depth`` and ``exception_tree_max_text`` configuration
+  parameters.
+
 6.0.1
 =====
 Date: 2024-09-24
@@ -797,4 +813,3 @@ Known Issues
 Known Issues
 ^^^^^^^^^^^^
 * Windows - pipe server doesn't work
-

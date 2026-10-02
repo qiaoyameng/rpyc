@@ -59,6 +59,11 @@ DEFAULT_CONFIG = dict(
     propagate_SystemExit_locally=False,  # whether to propagate SystemExit locally or to the other party
     propagate_KeyboardInterrupt_locally=True,  # whether to propagate KeyboardInterrupt locally or to the other party
     log_exceptions=True,
+    # EXCEPTION TREES
+    enable_exception_trees=True,  # advertise/use the structured exception tree format (negotiated per connection)
+    exception_tree_max_nodes=64,  # max number of exception nodes encoded/decoded per remote exception
+    exception_tree_max_depth=16,  # max nesting depth (groups, cause/context chains) before truncation
+    exception_tree_max_text=8192,  # max length of individual text fields (messages, notes, tracebacks)
     # MISC
     allow_pickle=False,
     connid=None,
@@ -110,6 +115,18 @@ Parameter                                Default value     Description
 ``propagate_KeyboardInterrupt_locally``  ``False``         Whether to propagate ``KeyboardInterrupt``
                                                            locally (kill the server) or to the other
                                                            party (kill the client)
+``enable_exception_trees``               ``True``          Whether to advertise and use the structured
+                                                           exception tree format (preserves
+                                                           ``ExceptionGroup`` hierarchies, notes and
+                                                           cause/context chains). Only used when the
+                                                           remote peer negotiates the capability;
+                                                           otherwise the legacy format is used.
+``exception_tree_max_nodes``             ``64``            Safety limit on the number of exception
+                                                           nodes encoded/decoded per remote exception
+``exception_tree_max_depth``             ``16``            Safety limit on exception nesting depth
+                                                           before a truncation marker is emitted
+``exception_tree_max_text``              ``8192``          Safety limit on the length of individual
+                                                           text fields (messages, notes, tracebacks)
 ``logger``                               ``None``          The logger instance to use to log exceptions
                                                            (before they are sent to the other party)
                                                            and other events. If ``None``, no logging takes place.
@@ -172,6 +189,13 @@ class Connection(object):
         self._send_queue = []
         self._local_root = root
         self._closed = False
+        # capability negotiation (see _get_remote_caps)
+        if self._config["enable_exception_trees"]:
+            self._local_caps = frozenset([vinegar.EXC_TREE_CAPABILITY])
+        else:
+            self._local_caps = frozenset()
+        self._remote_caps = None  # None = not negotiated yet
+        self._caps_negotiating = False
         # Settings for bind_threads
         self._bind_threads = self._config['bind_threads']
         self._threads = None
@@ -383,6 +407,19 @@ class Connection(object):
             self._send(consts.MSG_REPLY, seq, self._box(res))
 
     def _box_exc(self, typ, val, tb):  # dispatch?
+        if typ is not StopIteration and type(typ) is not str \
+                and self._config["enable_exception_trees"] \
+                and vinegar.EXC_TREE_CAPABILITY in self._get_remote_caps():
+            try:
+                return vinegar.dump_tree(typ, val, tb,
+                                         include_local_traceback=self._config["include_local_traceback"],
+                                         include_local_version=self._config["include_local_version"],
+                                         max_nodes=self._config["exception_tree_max_nodes"],
+                                         max_depth=self._config["exception_tree_max_depth"],
+                                         max_text=self._config["exception_tree_max_text"])
+            except Exception:
+                # never let the extended format break error reporting itself
+                pass
         return vinegar.dump(typ, val, tb,
                             include_local_traceback=self._config["include_local_traceback"],
                             include_local_version=self._config["include_local_version"])
@@ -391,7 +428,32 @@ class Connection(object):
         return vinegar.load(raw,
                             import_custom_exceptions=self._config["import_custom_exceptions"],
                             instantiate_custom_exceptions=self._config["instantiate_custom_exceptions"],
-                            instantiate_oldstyle_exceptions=self._config["instantiate_oldstyle_exceptions"])
+                            instantiate_oldstyle_exceptions=self._config["instantiate_oldstyle_exceptions"],
+                            max_nodes=self._config["exception_tree_max_nodes"])
+
+    def _get_remote_caps(self):
+        """Returns the remote peer's protocol capabilities, negotiating them
+        lazily on first use. Peers that do not understand ``HANDLE_GETCAPS``
+        (older RPyC versions) reply with a regular exception, in which case we
+        stick to the legacy wire formats."""
+        if self._remote_caps is not None:
+            return self._remote_caps
+        if not self._local_caps:
+            self._remote_caps = frozenset()
+            return self._remote_caps
+        if self._caps_negotiating:
+            # reentrant call while a negotiation is already in flight
+            # (e.g. an exception raised inside the negotiation handler)
+            return frozenset()
+        self._caps_negotiating = True
+        try:
+            caps = self.sync_request(consts.HANDLE_GETCAPS, tuple(sorted(self._local_caps)))
+            self._remote_caps = frozenset(caps)
+        except Exception:
+            self._remote_caps = frozenset()
+        finally:
+            self._caps_negotiating = False
+        return self._remote_caps
 
     def _seq_request_callback(self, msg, seq, is_exc, obj):
         _callback = self._request_callbacks.pop(seq, None)
@@ -829,10 +891,18 @@ class Connection(object):
             consts.HANDLE_BUFFITER: cls._handle_buffiter,
             consts.HANDLE_OLDSLICING: cls._handle_oldslicing,
             consts.HANDLE_CTXEXIT: cls._handle_ctxexit,
+            consts.HANDLE_GETCAPS: cls._handle_getcaps,
         }
 
     def _handle_ping(self, data):  # request handler
         return data
+
+    def _handle_getcaps(self, peer_caps=()):  # request handler
+        try:
+            self._remote_caps = frozenset(peer_caps)
+        except TypeError:
+            self._remote_caps = frozenset()
+        return tuple(sorted(self._local_caps))
 
     def _handle_close(self):  # request handler
         self._cleanup()
