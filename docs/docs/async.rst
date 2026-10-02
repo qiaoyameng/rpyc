@@ -107,3 +107,20 @@ tutorial.
 
 
 
+
+Remote async iterators
+----------------------
+Use :func:`rpyc.async_iter` to adapt a remote asynchronous generator or callable that returns
+one for use with ``async for``. The adapter performs an explicit capability handshake before
+creating an iterator, so endpoints that do not negotiate the protocol raise
+:class:`rpyc.RemoteAsyncIterationNotSupportedError` instead of being mistaken for supported
+peers.
+
+Example::
+
+    async for value in rpyc.async_iter(conn.root.stream_events):
+        print(value)
+
+Breaking out of the loop or awaiting ``aclose()`` sends the explicit remote close operation and
+allows the server-side generator's ``finally`` blocks to run. The first version of the protocol
+supports ``__anext__`` and ``aclose``; ``athrow`` and ``asend`` are rejected explicitly.

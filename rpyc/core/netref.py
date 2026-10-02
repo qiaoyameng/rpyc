@@ -118,8 +118,12 @@ class BaseNetref(object, metaclass=NetrefMetaclass):
         self.____refcount__ = 1
 
     def __del__(self):
+        count = self.____refcount__
+        self.____refcount__ = 0
+        if count <= 0:
+            return
         try:
-            asyncreq(self, consts.HANDLE_DEL, self.____refcount__)
+            asyncreq(self, consts.HANDLE_DEL, count)
         except Exception:
             # raised in a destructor, most likely on program termination,
             # when the connection might have already been closed.

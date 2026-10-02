@@ -16,6 +16,7 @@ from rpyc.lib import spawn, Timeout, get_methods, get_id_pack, hasattr_static
 from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # noqa: F401
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
 from rpyc.core import consts, brine, vinegar, netref
+from rpyc.core.async_iter import _AsyncIterationManager, _DEFERRED_REPLY
 from rpyc.core.async_ import AsyncResult
 
 
@@ -134,6 +135,7 @@ Parameter                                Default value     Description
 
 
 _connection_id_generator = itertools.count(1)
+_request_seq_local = threading.local()
 
 
 class Connection(object):
@@ -169,9 +171,13 @@ class Connection(object):
         self._proxy_cache = WeakValueDict()
         self._netref_classes_cache = {}
         self._remote_root = None
+        self._async_iteration_manager = None
+        self._async_serving = None
+        self._async_iterators = set()
         self._send_queue = []
         self._local_root = root
         self._closed = False
+        self._cleanup_finished = False
         # Settings for bind_threads
         self._bind_threads = self._config['bind_threads']
         self._threads = None
@@ -199,6 +205,21 @@ class Connection(object):
         if self._closed and not _anyway:
             return
         self._closed = True
+        manager = self._async_iteration_manager
+        if manager is not None:
+            manager.shutdown(lambda: self._finish_cleanup(_anyway, release_locks=False))
+            return
+        self._finish_cleanup(_anyway)
+
+    def _finish_cleanup(self, _anyway=True, release_locks=True):
+        if self._cleanup_finished:
+            return
+        self._cleanup_finished = True
+        if self._async_serving is not None:
+            self._async_serving.stop()
+        for adapter in self._async_iterators:
+            adapter.fail_all()
+        self._async_iterators.clear()
         self._channel.close()
         self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
@@ -213,7 +234,7 @@ class Connection(object):
         del self._HANDLERS
         if self._bind_threads:
             self._thread_pool_executor.shutdown(wait=True)  # TODO where?
-        if _anyway:
+        if release_locks and _anyway:
             try:
                 self._recvlock.release()
             except Exception:
@@ -363,6 +384,7 @@ class Connection(object):
         return cls(self, id_pack)
 
     def _dispatch_request(self, seq, raw_args):  # dispatch
+        _request_seq_local.seq = seq
         try:
             handler, args = raw_args
             args = self._unbox(args)
@@ -380,7 +402,8 @@ class Connection(object):
                 raise
             self._send(consts.MSG_EXCEPTION, seq, self._box_exc(t, v, tb))
         else:
-            self._send(consts.MSG_REPLY, seq, self._box(res))
+            if res is not _DEFERRED_REPLY:
+                self._send(consts.MSG_REPLY, seq, self._box(res))
 
     def _box_exc(self, typ, val, tb):  # dispatch?
         return vinegar.dump(typ, val, tb,
@@ -829,6 +852,12 @@ class Connection(object):
             consts.HANDLE_BUFFITER: cls._handle_buffiter,
             consts.HANDLE_OLDSLICING: cls._handle_oldslicing,
             consts.HANDLE_CTXEXIT: cls._handle_ctxexit,
+            consts.HANDLE_AITER_HELLO: cls._handle_aiter_hello,
+            consts.HANDLE_AITER_CREATE: cls._handle_aiter_create,
+            consts.HANDLE_AITER_ANEXT: cls._handle_aiter_anext,
+            consts.HANDLE_AITER_ATHROW: cls._handle_aiter_athrow,
+            consts.HANDLE_AITER_ACLOSE: cls._handle_aiter_aclose,
+            consts.HANDLE_AITER_CANCEL: cls._handle_aiter_cancel,
         }
 
     def _handle_ping(self, data):  # request handler
@@ -836,6 +865,29 @@ class Connection(object):
 
     def _handle_close(self):  # request handler
         self._cleanup()
+
+    def _async_iteration(self):
+        if self._async_iteration_manager is None:
+            self._async_iteration_manager = _AsyncIterationManager(self)
+        return self._async_iteration_manager
+
+    def _handle_aiter_hello(self):
+        return self._async_iteration().hello()
+
+    def _handle_aiter_create(self, source, args=(), kwargs=()):
+        return self._async_iteration().create(_request_seq_local.seq, source, args, kwargs)
+
+    def _handle_aiter_anext(self, iterator_id, pull_id):
+        return self._async_iteration().anext(_request_seq_local.seq, iterator_id, pull_id)
+
+    def _handle_aiter_athrow(self, iterator_id, args=(), kwargs=()):
+        return self._async_iteration().athrow(iterator_id, args, kwargs)
+
+    def _handle_aiter_aclose(self, iterator_id):
+        return self._async_iteration().aclose(_request_seq_local.seq, iterator_id)
+
+    def _handle_aiter_cancel(self, iterator_id, pull_id):
+        return self._async_iteration().cancel(iterator_id, pull_id)
 
     def _handle_getroot(self):  # request handler
         return self._local_root
