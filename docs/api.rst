@@ -57,6 +57,7 @@ Server-Side
    api/utils_server
    api/utils_authenticators
    api/utils_registry
+   api/utils_lease
 
 * :ref:`api-server` - The core implementation of RPyC servers; includes the implementation of
   the forking and threaded servers.
@@ -66,6 +67,9 @@ Server-Side
   different servers by name.
 
 * :ref:`api-authenticators` - Implementation of two common authenticators, for SSL and TLSlite.
+
+* :ref:`api-lease` - Explicit server-side leases: revoke a whole group of session-scoped
+  remote references at once.
 
 Client-Side
 -----------
