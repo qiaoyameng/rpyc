@@ -169,6 +169,8 @@ class Connection(object):
         self._proxy_cache = WeakValueDict()
         self._netref_classes_cache = {}
         self._remote_root = None
+        self._remote_capabilities = ()
+        self._capabilities_negotiated = False
         self._send_queue = []
         self._local_root = root
         self._closed = False
@@ -383,15 +385,19 @@ class Connection(object):
             self._send(consts.MSG_REPLY, seq, self._box(res))
 
     def _box_exc(self, typ, val, tb):  # dispatch?
+        structured = consts.CAPABILITY_STRUCTURED_EXCEPTIONS in self._remote_capabilities
         return vinegar.dump(typ, val, tb,
                             include_local_traceback=self._config["include_local_traceback"],
-                            include_local_version=self._config["include_local_version"])
+                            include_local_version=self._config["include_local_version"],
+                            structured=structured)
 
     def _unbox_exc(self, raw):  # dispatch?
+        structured = consts.CAPABILITY_STRUCTURED_EXCEPTIONS in self._remote_capabilities
         return vinegar.load(raw,
                             import_custom_exceptions=self._config["import_custom_exceptions"],
                             instantiate_custom_exceptions=self._config["instantiate_custom_exceptions"],
-                            instantiate_oldstyle_exceptions=self._config["instantiate_oldstyle_exceptions"])
+                            instantiate_oldstyle_exceptions=self._config["instantiate_oldstyle_exceptions"],
+                            structured=structured)
 
     def _seq_request_callback(self, msg, seq, is_exc, obj):
         _callback = self._request_callbacks.pop(seq, None)
@@ -743,6 +749,23 @@ class Connection(object):
         # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
         return _async_res.value
 
+    def negotiate_capabilities(self):
+        nonce = f"rpyc-capability-{os.getpid()}-{id(self)}"
+        request = (consts.CAPABILITIES_MAGIC, nonce, consts.LOCAL_CAPABILITIES)
+        reply = self.sync_request(consts.HANDLE_PING, request)
+
+        if reply == request:
+            remote_capabilities = ()
+        elif (isinstance(reply, tuple) and len(reply) == 3
+              and reply[0] == consts.CAPABILITIES_REPLY_MAGIC and reply[1] == nonce):
+            remote_capabilities = tuple(cap for cap in reply[2] if type(cap) is str)
+        else:
+            raise ValueError("invalid capability negotiation reply")
+
+        self._remote_capabilities = remote_capabilities
+        self._capabilities_negotiated = True
+        return remote_capabilities
+
     def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
         seq = self._get_seq_id()
         self._request_callbacks[seq] = callback
@@ -832,6 +855,11 @@ class Connection(object):
         }
 
     def _handle_ping(self, data):  # request handler
+        if (isinstance(data, tuple) and len(data) == 3
+                and data[0] == consts.CAPABILITIES_MAGIC and type(data[1]) is str):
+            self._remote_capabilities = tuple(cap for cap in data[2] if type(cap) is str)
+            self._capabilities_negotiated = True
+            return consts.CAPABILITIES_REPLY_MAGIC, data[1], consts.LOCAL_CAPABILITIES
         return data
 
     def _handle_close(self):  # request handler

@@ -36,7 +36,7 @@ class ForbiddenError(Exception):
 # ------------------------------------------------------------------------------
 # API
 # ------------------------------------------------------------------------------
-def connect_channel(channel, service=VoidService, config={}):
+def connect_channel(channel, service=VoidService, config={}, negotiate_capabilities=False):
     """creates a connection over a given channel
 
     :param channel: the channel to use
@@ -45,10 +45,10 @@ def connect_channel(channel, service=VoidService, config={}):
 
     :returns: an RPyC connection
     """
-    return service._connect(channel, config)
+    return service._connect(channel, config, negotiate_capabilities=negotiate_capabilities)
 
 
-def connect_stream(stream, service=VoidService, config={}):
+def connect_stream(stream, service=VoidService, config={}, negotiate_capabilities=False):
     """creates a connection over a given stream
 
     :param stream: the stream to use
@@ -57,7 +57,8 @@ def connect_stream(stream, service=VoidService, config={}):
 
     :returns: an RPyC connection
     """
-    return connect_channel(Channel(stream), service=service, config=config)
+    return connect_channel(Channel(stream), service=service, config=config,
+                           negotiate_capabilities=negotiate_capabilities)
 
 
 def connect_pipes(input, output, service=VoidService, config={}):
@@ -100,7 +101,7 @@ def connect(host, port, service=VoidService, config={}, ipv6=False, keepalive=Fa
     :returns: an RPyC connection
     """
     s = SocketStream.connect(host, port, ipv6=ipv6, keepalive=keepalive)
-    return connect_stream(s, service, config)
+    return connect_stream(s, service, config, negotiate_capabilities=True)
 
 
 def unix_connect(path, service=VoidService, config={}):
@@ -114,7 +115,7 @@ def unix_connect(path, service=VoidService, config={}):
     :returns: an RPyC connection
     """
     s = SocketStream.unix_connect(path)
-    return connect_stream(s, service, config)
+    return connect_stream(s, service, config, negotiate_capabilities=True)
 
 
 def ssl_connect(host, port, keyfile=None, certfile=None, ca_certs=None,
@@ -167,7 +168,7 @@ def ssl_connect(host, port, keyfile=None, certfile=None, ca_certs=None,
     if ciphers is not None:
         ssl_kwargs["ciphers"] = ciphers
     s = SocketStream.ssl_connect(host, port, ssl_kwargs, ipv6=ipv6, keepalive=keepalive)
-    return connect_stream(s, service, config)
+    return connect_stream(s, service, config, negotiate_capabilities=True)
 
 
 def _get_free_port():
@@ -204,7 +205,7 @@ def ssh_connect(remote_machine, remote_port, service=VoidService, config={}):
         tun = remote_machine.tunnel(loc_port, remote_port)
         stream = TunneledSocketStream.connect("localhost", loc_port)
         stream.tun = tun
-    return service._connect(Channel(stream), config=config)
+    return service._connect(Channel(stream), config=config, negotiate_capabilities=True)
 
 
 def discover(service_name, host=None, registrar=None, timeout=2):

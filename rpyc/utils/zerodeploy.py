@@ -223,7 +223,8 @@ class DeployedServer(object):
         """Same as :func:`~rpyc.utils.factory.connect`, but with the ``host`` and ``port``
         parameters fixed"""
         return rpyc.utils.factory.connect_stream(
-            SocketStream(self._connect_sock()), service=service, config=config)
+            SocketStream(self._connect_sock()), service=service, config=config,
+            negotiate_capabilities=True)
 
     def classic_connect(self):
         """Same as :func:`classic.connect <rpyc.utils.classic.connect>`, but with the ``host`` and

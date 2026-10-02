@@ -37,6 +37,18 @@ HANDLE_INSTANCECHECK = 20
 # optimized exceptions
 EXC_STOP_ITERATION = 1
 
+# capabilities
+CAPABILITIES_MAGIC = "\x00rpyc-capabilities"
+CAPABILITIES_REPLY_MAGIC = "\x00rpyc-capabilities-reply"
+CAPABILITY_STRUCTURED_EXCEPTIONS = "structured-exceptions"
+
+try:
+    ExceptionGroup
+except NameError:
+    LOCAL_CAPABILITIES = ()
+else:
+    LOCAL_CAPABILITIES = (CAPABILITY_STRUCTURED_EXCEPTIONS,)
+
 # IO values
 STREAM_CHUNK = 64000  # read/write chunk is 64KB, too large of a value will degrade response for other clients
 

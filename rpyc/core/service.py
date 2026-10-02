@@ -95,7 +95,7 @@ class Service(object):
     exposed_get_service_name = get_service_name
 
     @hybridmethod
-    def _connect(self, channel, config={}):
+    def _connect(self, channel, config={}, negotiate_capabilities=False):
         """Setup a connection via the given channel."""
         if isinstance(self, type):  # autovivify if accessed as class method
             self = self()
@@ -103,6 +103,8 @@ class Service(object):
         # compatibility and convenience. You could pass in a different root if
         # you wanted:
         conn = self._protocol(self, channel, config)
+        if negotiate_capabilities:
+            conn.negotiate_capabilities()
         self.on_connect(conn)
         return conn
 
