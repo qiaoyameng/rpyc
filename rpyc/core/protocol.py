@@ -24,6 +24,13 @@ class PingError(Exception):
     pass
 
 
+class RequestLimitExceeded(Exception):
+    """The exception raised when a connection's in-flight request limit
+    (``max_inflight_requests``) is reached and a request cannot be submitted,
+    either immediately or within the bounded wait timeout"""
+    pass
+
+
 UNBOUND_THREAD_ID = 0  # Used when the message is being sent but the thread is not bound yet.
 DEFAULT_CONFIG = dict(
     # ATTRIBUTES
@@ -66,6 +73,8 @@ DEFAULT_CONFIG = dict(
     endpoints=None,
     logger=None,
     sync_request_timeout=30,
+    max_inflight_requests=None,
+    inflight_wait_timeout=30,
     before_closed=None,
     close_catchall=False,
     bind_threads=os.environ.get('RPYC_BIND_THREADS') == 'true',
@@ -126,6 +135,16 @@ Parameter                                Default value     Description
                                                            do no have this configuration option set.
 
 ``sync_request_timeout``                 ``30``            Default timeout for waiting results
+``max_inflight_requests``                ``None``          Optional limit on the number of in-flight
+                                                           (submitted, not yet completed) requests. When
+                                                           the limit is reached, :meth:`Connection.async_request`
+                                                           raises :class:`RequestLimitExceeded` immediately,
+                                                           while :meth:`Connection.async_request_wait` waits
+                                                           for a permit for a bounded time. ``None`` (the
+                                                           default) means no limit.
+``inflight_wait_timeout``                ``30``            Default bounded wait (in seconds) for an
+                                                           in-flight request permit used by
+                                                           :meth:`Connection.async_request_wait`
 ``bind_threads``                         ``False``         Whether to restrict request/reply by thread (experimental).
                                                            The default value is False. Setting the environment variable
                                                            `RPYC_BIND_THREADS` to `"true"` will enable this feature.
@@ -164,6 +183,8 @@ class Connection(object):
         self._sendlock = Lock()
         self._recv_event = Condition()  # TODO: why not simply timeout? why not associate w/ recvlock? explain/redesign
         self._request_callbacks = {}
+        self._inflight_cond = Condition()
+        self._inflight = set()  # seqs currently holding an in-flight request permit
         self._local_objects = RefCountingColl()
         self._last_traceback = None
         self._proxy_cache = WeakValueDict()
@@ -202,6 +223,9 @@ class Connection(object):
         self._channel.close()
         self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
+        with self._inflight_cond:
+            self._inflight.clear()
+            self._inflight_cond.notify_all()
         self._local_objects.clear()
         self._proxy_cache.clear()
         self._netref_classes_cache.clear()
@@ -395,11 +419,61 @@ class Connection(object):
 
     def _seq_request_callback(self, msg, seq, is_exc, obj):
         _callback = self._request_callbacks.pop(seq, None)
+        self._release_inflight_permit(seq)
         if _callback is not None:
             _callback(is_exc, obj)
         elif self._config["logger"] is not None:
             debug_msg = 'Recieved {} seq {} and a related request callback did not exist'
             self._config["logger"].debug(debug_msg.format(msg, seq))
+
+    def _acquire_inflight_permit(self, seq, wait_timeout=0):  # serving
+        """Registers ``seq`` against the configured in-flight request limit.
+
+        With a falsy ``wait_timeout``, submission is rejected immediately when
+        the limit is reached. Otherwise, waits up to ``wait_timeout`` seconds
+        for a permit. The wait never holds the receive lock and the request is
+        never queued before a permit is acquired; while waiting, the connection
+        is served in bounded slices so that pending replies (which release
+        permits) and reentrant reverse calls can make progress instead of
+        deadlocking both parties.
+        """
+        limit = self._config["max_inflight_requests"]
+        if limit is None:
+            return
+        timeout = Timeout(wait_timeout) if wait_timeout else None
+        while True:
+            with self._inflight_cond:
+                if len(self._inflight) < limit:
+                    self._inflight.add(seq)
+                    return
+                if self._closed:
+                    raise EOFError("connection is closed")
+                if timeout is None or timeout.expired():
+                    raise RequestLimitExceeded(
+                        f"in-flight request limit ({limit}) reached")
+                self._inflight_cond.wait(min(timeout.timeleft(), 0.1))
+            # bounded progress outside the permit lock: pump pending incoming
+            # data so that replies and reverse calls can move forward
+            self.serve(0)
+
+    def _release_inflight_permit(self, seq):  # serving
+        """Releases the in-flight permit held by ``seq``, if any. Idempotent:
+        duplicate completion and runtime config changes never over-release."""
+        with self._inflight_cond:
+            if seq in self._inflight:
+                self._inflight.discard(seq)
+                self._inflight_cond.notify_all()
+
+    def _cancel_request(self, seq):  # serving
+        """Locally cancels the request registered under ``seq``: drops its
+        callback (a late reply, should one arrive, is discarded) and releases
+        its in-flight permit, if any.
+
+        :returns: ``True`` if a pending request was actually cancelled
+        """
+        callback = self._request_callbacks.pop(seq, None)
+        self._release_inflight_permit(seq)
+        return callback is not None
 
     def _dispatch(self, data):  # serving---dispatch?
         msg, = brine.I1.unpack(data[:1])  # unpack just msg to minimize time to release
@@ -418,6 +492,10 @@ class Connection(object):
                     this_thread._remote_thread_id = UNBOUND_THREAD_ID
             if msg == consts.MSG_REPLY:
                 seq, args = brine.load(data[1:])
+                # the reply arrived, so the in-flight request is complete:
+                # release its permit before unboxing, which may issue nested
+                # requests (e.g. HANDLE_INSPECT for netref class construction)
+                self._release_inflight_permit(seq)
                 obj = self._unbox(args)
                 self._seq_request_callback(msg, seq, False, obj)
                 if not self._bind_threads:
@@ -426,6 +504,7 @@ class Connection(object):
                 if not self._bind_threads:
                     self._recvlock.release()
                 seq, args = brine.load(data[1:])
+                self._release_inflight_permit(seq)
                 obj = self._unbox_exc(args)
                 self._seq_request_callback(msg, seq, True, obj)
             else:
@@ -743,8 +822,9 @@ class Connection(object):
         # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
         return _async_res.value
 
-    def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
+    def _async_request(self, handler, args=(), callback=(lambda a, b: None), wait_timeout=0):  # serving
         seq = self._get_seq_id()
+        self._acquire_inflight_permit(seq, wait_timeout)
         self._request_callbacks[seq] = callback
         try:
             self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
@@ -753,10 +833,16 @@ class Connection(object):
             # depending on the case, the MSG_REQUEST may or may not have been sent completely
             # so, pop the callback and raise to keep response integrity is consistent
             self._request_callbacks.pop(seq, None)
+            self._release_inflight_permit(seq)
             raise
+        return seq
 
     def async_request(self, handler, *args, **kwargs):  # serving
         """Send an asynchronous request (does not wait for it to finish)
+
+        Submission is rejected immediately with :class:`RequestLimitExceeded`
+        when the connection's ``max_inflight_requests`` limit is reached; use
+        :meth:`async_request_wait` for bounded-wait submission.
 
         :returns: an :class:`rpyc.core.async_.AsyncResult` object, which will
                   eventually hold the result (or exception)
@@ -765,7 +851,35 @@ class Connection(object):
         if kwargs:
             raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
         res = AsyncResult(self)
-        self._async_request(handler, args, res)
+        res._cancel_info = (self, self._async_request(handler, args, res))
+        if timeout is not None:
+            res.set_expiry(timeout)
+        return res
+
+    def async_request_wait(self, handler, *args, **kwargs):  # serving
+        """Send an asynchronous request, waiting up to ``wait_timeout``
+        seconds for an in-flight request permit when the connection's
+        ``max_inflight_requests`` limit is reached. While waiting, the
+        connection is served in bounded slices (without holding the receive
+        lock, and without queuing the request first) so that reentrant
+        reverse calls and pending replies can make progress.
+
+        :param wait_timeout: maximal time to wait for a permit, in seconds
+                             (defaults to the ``inflight_wait_timeout``
+                             configuration parameter)
+        :raises: :class:`RequestLimitExceeded` if no permit became available
+                 within ``wait_timeout``
+        :returns: an :class:`rpyc.core.async_.AsyncResult` object, which will
+                  eventually hold the result (or exception)
+        """
+        timeout = kwargs.pop("timeout", None)
+        wait_timeout = kwargs.pop("wait_timeout", None)
+        if kwargs:
+            raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
+        if wait_timeout is None:
+            wait_timeout = self._config["inflight_wait_timeout"]
+        res = AsyncResult(self)
+        res._cancel_info = (self, self._async_request(handler, args, res, wait_timeout=wait_timeout))
         if timeout is not None:
             res.set_expiry(timeout)
         return res

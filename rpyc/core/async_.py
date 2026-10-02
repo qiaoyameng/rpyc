@@ -9,7 +9,7 @@ class AsyncResult(object):
     will eventually have a result. Use the :attr:`value` property to access the
     result (which will block if the result has not yet arrived).
     """
-    __slots__ = ["_conn", "_is_ready", "_is_exc", "_callbacks", "_obj", "_ttl"]
+    __slots__ = ["_conn", "_is_ready", "_is_exc", "_callbacks", "_obj", "_ttl", "_cancel_info"]
 
     def __init__(self, conn):
         self._conn = conn
@@ -18,6 +18,7 @@ class AsyncResult(object):
         self._obj = None
         self._callbacks = []
         self._ttl = Timeout(None)
+        self._cancel_info = None
 
     def __repr__(self):
         if self._is_ready:
@@ -43,7 +44,8 @@ class AsyncResult(object):
     def wait(self):
         """Waits for the result to arrive. If the AsyncResult object has an
         expiry set, and the result did not arrive within that timeout,
-        an :class:`AsyncResultTimeout` exception is raised"""
+        an :class:`AsyncResultTimeout` exception is raised. On expiry the
+        request is locally cancelled (see :meth:`cancel`)"""
         while self._waiting():
             # Serve the connection since we are not ready. Suppose
             # the reply for our seq is served. The callback is this class
@@ -52,7 +54,31 @@ class AsyncResult(object):
 
         # Check if we timed out before result was ready
         if not self._is_ready:
+            self.cancel()
             raise AsyncResultTimeout("result expired")
+
+    def cancel(self):
+        """Locally cancels the request: its callback is removed from the
+        connection (releasing any in-flight request permit it holds) and a
+        late reply, should one arrive, is discarded. The result transitions
+        to a ready error state; accessing :attr:`value` will raise
+        :class:`AsyncResultTimeout`.
+
+        :returns: ``True`` if the result was pending and is now cancelled
+        """
+        if self._is_ready:
+            return False
+        self._is_exc = True
+        self._obj = AsyncResultTimeout("request cancelled")
+        self._is_ready = True
+        cancel_info, self._cancel_info = self._cancel_info, None
+        if cancel_info is not None:
+            conn, seq = cancel_info
+            conn._cancel_request(seq)
+        for cb in self._callbacks:
+            cb(self)
+        del self._callbacks[:]
+        return True
 
     def _waiting(self):
         return not (self._is_ready or self.expired)
