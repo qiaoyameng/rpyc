@@ -1,3 +1,15 @@
+Unreleased
+==========
+
+- Added optional call-chain deadline budgets (``call_chain_budget`` config and
+  ``Connection.deadline()``): the remaining budget is propagated on the wire as
+  relative seconds, adopted by each peer as a local monotonic deadline, and
+  inherited by nested requests and reverse callbacks. Legacy peers that do not
+  answer the ``HANDLE_GETCAPS`` capability query keep the legacy wire format;
+  the budget is then enforced locally only and ``Connection.deadline_propagation``
+  reports ``False``. Expired requests are rejected before dispatch and their
+  reply callbacks are cleaned up so late replies are discarded safely.
+
 6.0.1
 =====
 Date: 2024-09-24
@@ -797,4 +809,3 @@ Known Issues
 Known Issues
 ^^^^^^^^^^^^
 * Windows - pipe server doesn't work
-

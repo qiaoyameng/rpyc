@@ -11,11 +11,12 @@ import concurrent.futures as c_futures
 import os
 import threading
 
+from contextlib import nullcontext
 from threading import Lock, Condition, RLock
 from rpyc.lib import spawn, Timeout, get_methods, get_id_pack, hasattr_static
 from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # noqa: F401
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
-from rpyc.core import consts, brine, vinegar, netref
+from rpyc.core import consts, brine, vinegar, netref, deadline as _deadline
 from rpyc.core.async_ import AsyncResult
 
 
@@ -23,6 +24,12 @@ class PingError(Exception):
     """The exception raised should :func:`Connection.ping` fail"""
     pass
 
+
+CAPABILITY_DEADLINE_BUDGET = "deadline-budget"
+"""Wire capability announcing support for call-chain deadline budgets"""
+
+CAPABILITIES = frozenset([CAPABILITY_DEADLINE_BUDGET])
+"""The set of optional wire capabilities this endpoint supports"""
 
 UNBOUND_THREAD_ID = 0  # Used when the message is being sent but the thread is not bound yet.
 DEFAULT_CONFIG = dict(
@@ -66,6 +73,7 @@ DEFAULT_CONFIG = dict(
     endpoints=None,
     logger=None,
     sync_request_timeout=30,
+    call_chain_budget=None,
     before_closed=None,
     close_catchall=False,
     bind_threads=os.environ.get('RPYC_BIND_THREADS') == 'true',
@@ -126,10 +134,34 @@ Parameter                                Default value     Description
                                                            do no have this configuration option set.
 
 ``sync_request_timeout``                 ``30``            Default timeout for waiting results
+``call_chain_budget``                    ``None``          Optional total budget (in seconds) for an entire
+                                                           chain of nested and reentrant requests started on
+                                                           this connection. See the note below. ``None``
+                                                           disables the feature (legacy behavior).
 ``bind_threads``                         ``False``         Whether to restrict request/reply by thread (experimental).
                                                            The default value is False. Setting the environment variable
                                                            `RPYC_BIND_THREADS` to `"true"` will enable this feature.
 =======================================  ================  =====================================================
+
+.. note::
+   **Call-chain deadline budgets.** When ``call_chain_budget`` is set (or
+   :meth:`Connection.deadline` is used), every top-level request establishes a
+   deadline for the whole call chain. Outgoing requests made while a budget is
+   active carry the *remaining* budget (relative seconds, never absolute
+   timestamps, so peers with different clock origins interoperate); the
+   receiving endpoint adopts it as a local deadline against its own monotonic
+   clock, and nested requests as well as reverse callbacks inherit it. An
+   explicit per-request timeout may only tighten the remaining budget. A
+   timeout never kills the remote Python thread serving the request; it only
+   stops the local wait and the propagation of further requests.
+
+   **Compatibility.** Budgets are only attached to requests after the peer
+   confirms the ``deadline-budget`` capability (negotiated lazily via
+   ``HANDLE_GETCAPS``). Legacy endpoints that fail the capability query keep
+   receiving requests in the legacy format; the budget is then enforced
+   locally only, a warning is logged (if a logger is configured), and
+   :attr:`Connection.deadline_propagation` reports ``False`` so that
+   end-to-end enforcement is never silently assumed.
 """
 
 
@@ -172,6 +204,10 @@ class Connection(object):
         self._send_queue = []
         self._local_root = root
         self._closed = False
+        # Call-chain deadline budget support (lazily negotiated, see _peer_capabilities)
+        self._peer_caps = None
+        self._negotiating_caps = False
+        self._budget_fallback_warned = False
         # Settings for bind_threads
         self._bind_threads = self._config['bind_threads']
         self._threads = None
@@ -265,6 +301,82 @@ class Connection(object):
         res = self.async_request(consts.HANDLE_PING, data, timeout=timeout)
         if res.value != data:
             raise PingError("echo mismatches sent data")
+
+    def deadline(self, seconds):
+        """Establishes a call-chain deadline budget of ``seconds`` for the
+        requests issued by the current thread, as a context manager::
+
+            with conn.deadline(5):
+                conn.root.foo()   # the whole (reentrant) call chain gets 5s
+
+        If a budget is already active, the new deadline may only tighten it.
+        """
+        return _deadline.scope(seconds)
+
+    @property
+    def deadline_propagation(self):
+        """Indicates whether call-chain deadline budgets are propagated to the
+        peer end-to-end. ``None`` means the capability has not been negotiated
+        yet (no budgeted request has been sent); ``False`` means the peer is a
+        legacy endpoint and budgets are enforced locally only."""
+        if self._peer_caps is None:
+            return None
+        return CAPABILITY_DEADLINE_BUDGET in self._peer_caps
+
+    def _budget_scope(self):
+        budget = self._config["call_chain_budget"]
+        if budget is not None and _deadline.get_deadline() is None:
+            return _deadline.scope(budget)
+        return nullcontext()
+
+    def _effective_timeout(self, timeout):
+        rem = _deadline.remaining()
+        if rem is None:
+            return timeout
+        rem = max(rem, 0)
+        return rem if timeout is None else min(timeout, rem)
+
+    def _peer_capabilities(self):
+        if self._peer_caps is None:
+            self._negotiating_caps = True
+            try:
+                self._peer_caps = frozenset(self.sync_request(consts.HANDLE_GETCAPS))
+            except Exception:
+                # Legacy endpoints reply with an exception for unknown handlers;
+                # per the compatibility rules they are treated as capability-less.
+                self._peer_caps = frozenset()
+            finally:
+                self._negotiating_caps = False
+        return self._peer_caps
+
+    def _outbound_budget(self):
+        """Computes the remaining call-chain budget to attach to an outgoing
+        request, or ``None`` when the request is sent in the legacy format.
+
+        :raises TimeoutError: when the budget is already exhausted, before the
+                              request is dispatched
+        """
+        rem = _deadline.remaining()
+        if rem is None or self._negotiating_caps:
+            return None
+        if rem <= 0:
+            raise TimeoutError("call-chain budget exhausted before request could be dispatched")
+        if CAPABILITY_DEADLINE_BUDGET in self._peer_capabilities():
+            return rem
+        # Compatibility rule for legacy endpoints (see DEFAULT_CONFIG): send
+        # the request without a budget and enforce the budget locally only.
+        if not self._budget_fallback_warned:
+            self._budget_fallback_warned = True
+            logger = self._config["logger"]
+            if logger is not None:
+                logger.warning("peer does not support call-chain deadline budgets; "
+                               "enforcing the budget locally only")
+        return None
+
+    def _remote_budget_scope(self, remote_budget):
+        if remote_budget is None:
+            return nullcontext()
+        return _deadline.scope_at(_deadline.monotonic() + remote_budget)
 
     def _get_seq_id(self):  # IO
         return next(self._seqcounter)
@@ -364,9 +476,13 @@ class Connection(object):
 
     def _dispatch_request(self, seq, raw_args):  # dispatch
         try:
-            handler, args = raw_args
+            handler, args = raw_args[0], raw_args[1]
+            remote_budget = raw_args[2] if len(raw_args) > 2 else None
             args = self._unbox(args)
-            res = self._HANDLERS[handler](self, *args)
+            if remote_budget is not None and remote_budget <= 0:
+                raise TimeoutError("call-chain budget exhausted before request was dispatched")
+            with self._remote_budget_scope(remote_budget):
+                res = self._HANDLERS[handler](self, *args)
         except:  # TODO: revisit how to catch handle locally, this should simplify when py2 is dropped
             # need to catch old style exceptions too
             t, v, tb = sys.exc_info()
@@ -737,23 +853,29 @@ class Connection(object):
         :raises: any exception that the requests may be generated
         :returns: the result of the request
         """
-        timeout = self._config["sync_request_timeout"]
-        _async_res = self.async_request(handler, *args, timeout=timeout)
-        # _async_res is an instance of AsyncResult, the value property invokes Connection.serve via AsyncResult.wait
-        # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
-        return _async_res.value
+        with self._budget_scope():
+            timeout = self._config["sync_request_timeout"]
+            _async_res = self.async_request(handler, *args, timeout=timeout)
+            # _async_res is an instance of AsyncResult, the value property invokes Connection.serve via AsyncResult.wait
+            # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
+            return _async_res.value
 
     def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
+        budget = self._outbound_budget()
         seq = self._get_seq_id()
         self._request_callbacks[seq] = callback
         try:
-            self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
+            if budget is None:
+                self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
+            else:
+                self._send(consts.MSG_REQUEST, seq, (handler, self._box(args), budget))
         except Exception:
             # TODO: review test_remote_exception, logging exceptions show attempt to write on closed stream
             # depending on the case, the MSG_REQUEST may or may not have been sent completely
             # so, pop the callback and raise to keep response integrity is consistent
             self._request_callbacks.pop(seq, None)
             raise
+        return seq
 
     def async_request(self, handler, *args, **kwargs):  # serving
         """Send an asynchronous request (does not wait for it to finish)
@@ -764,11 +886,13 @@ class Connection(object):
         timeout = kwargs.pop("timeout", None)
         if kwargs:
             raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
-        res = AsyncResult(self)
-        self._async_request(handler, args, res)
-        if timeout is not None:
-            res.set_expiry(timeout)
-        return res
+        with self._budget_scope():
+            res = AsyncResult(self)
+            res._seq = self._async_request(handler, args, res)
+            timeout = self._effective_timeout(timeout)
+            if timeout is not None:
+                res.set_expiry(timeout)
+            return res
 
     @property
     def root(self):  # serving
@@ -829,7 +953,11 @@ class Connection(object):
             consts.HANDLE_BUFFITER: cls._handle_buffiter,
             consts.HANDLE_OLDSLICING: cls._handle_oldslicing,
             consts.HANDLE_CTXEXIT: cls._handle_ctxexit,
+            consts.HANDLE_GETCAPS: cls._handle_getcaps,
         }
+
+    def _handle_getcaps(self):  # request handler
+        return tuple(sorted(CAPABILITIES))
 
     def _handle_ping(self, data):  # request handler
         return data

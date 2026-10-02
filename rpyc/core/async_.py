@@ -9,7 +9,7 @@ class AsyncResult(object):
     will eventually have a result. Use the :attr:`value` property to access the
     result (which will block if the result has not yet arrived).
     """
-    __slots__ = ["_conn", "_is_ready", "_is_exc", "_callbacks", "_obj", "_ttl"]
+    __slots__ = ["_conn", "_is_ready", "_is_exc", "_callbacks", "_obj", "_ttl", "_seq"]
 
     def __init__(self, conn):
         self._conn = conn
@@ -18,6 +18,7 @@ class AsyncResult(object):
         self._obj = None
         self._callbacks = []
         self._ttl = Timeout(None)
+        self._seq = None
 
     def __repr__(self):
         if self._is_ready:
@@ -52,7 +53,16 @@ class AsyncResult(object):
 
         # Check if we timed out before result was ready
         if not self._is_ready:
+            self._forget_request()
             raise AsyncResultTimeout("result expired")
+
+    def _forget_request(self):
+        # Drop the reply callback of an expired request so that a late reply
+        # is discarded by the connection instead of being delivered to this
+        # stale result, and so the callback registry does not leak.
+        if self._seq is not None:
+            self._conn._request_callbacks.pop(self._seq, None)
+            self._seq = None
 
     def _waiting(self):
         return not (self._is_ready or self.expired)
