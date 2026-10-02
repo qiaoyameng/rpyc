@@ -24,6 +24,13 @@ class PingError(Exception):
     pass
 
 
+class InflightLimitExceeded(Exception):
+    """The exception raised when a request cannot be submitted because the
+    connection's ``max_inflight_requests`` limit has been reached and no slot
+    became available within the allotted ``slot_timeout``"""
+    pass
+
+
 UNBOUND_THREAD_ID = 0  # Used when the message is being sent but the thread is not bound yet.
 DEFAULT_CONFIG = dict(
     # ATTRIBUTES
@@ -69,6 +76,7 @@ DEFAULT_CONFIG = dict(
     before_closed=None,
     close_catchall=False,
     bind_threads=os.environ.get('RPYC_BIND_THREADS') == 'true',
+    max_inflight_requests=None,
 )
 """
 The default configuration dictionary of the protocol. You can override these parameters
@@ -126,6 +134,11 @@ Parameter                                Default value     Description
                                                            do no have this configuration option set.
 
 ``sync_request_timeout``                 ``30``            Default timeout for waiting results
+``max_inflight_requests``                ``None``          Maximal number of requests that may be awaiting a reply
+                                                          at any given moment. ``None`` (the default) means
+                                                          unlimited. When the limit is reached, requests are
+                                                          either rejected immediately or after a bounded wait,
+                                                          depending on the ``slot_timeout`` submission mode.
 ``bind_threads``                         ``False``         Whether to restrict request/reply by thread (experimental).
                                                            The default value is False. Setting the environment variable
                                                            `RPYC_BIND_THREADS` to `"true"` will enable this feature.
@@ -164,6 +177,8 @@ class Connection(object):
         self._sendlock = Lock()
         self._recv_event = Condition()  # TODO: why not simply timeout? why not associate w/ recvlock? explain/redesign
         self._request_callbacks = {}
+        self._inflight_seqs = set()  # seq ids currently holding an in-flight slot
+        self._inflight_cond = Condition()
         self._local_objects = RefCountingColl()
         self._last_traceback = None
         self._proxy_cache = WeakValueDict()
@@ -202,6 +217,10 @@ class Connection(object):
         self._channel.close()
         self._local_root.on_disconnect(self)
         self._request_callbacks.clear()
+        with self._inflight_cond:
+            # release all remaining slots and wake up any bounded-wait submitters
+            self._inflight_seqs.clear()
+            self._inflight_cond.notify_all()
         self._local_objects.clear()
         self._proxy_cache.clear()
         self._netref_classes_cache.clear()
@@ -393,13 +412,67 @@ class Connection(object):
                             instantiate_custom_exceptions=self._config["instantiate_custom_exceptions"],
                             instantiate_oldstyle_exceptions=self._config["instantiate_oldstyle_exceptions"])
 
-    def _seq_request_callback(self, msg, seq, is_exc, obj):
-        _callback = self._request_callbacks.pop(seq, None)
-        if _callback is not None:
-            _callback(is_exc, obj)
+    def _pop_request_callback(self, seq):
+        # The reply for ``seq`` has arrived, so its in-flight slot is released
+        # here. This must happen before unboxing the reply (which may issue
+        # nested requests, e.g. HANDLE_INSPECT) and before invoking the
+        # callback (which may submit follow-up requests), so that both observe
+        # the freed slot.
+        callback = self._request_callbacks.pop(seq, None)
+        self._release_inflight_slot(seq)
+        return callback
+
+    def _seq_request_callback(self, msg, seq, is_exc, obj, callback):
+        if callback is not None:
+            callback(is_exc, obj)
         elif self._config["logger"] is not None:
             debug_msg = 'Recieved {} seq {} and a related request callback did not exist'
             self._config["logger"].debug(debug_msg.format(msg, seq))
+
+    def _acquire_inflight_slot(self, seq, slot_timeout):
+        """Registers ``seq`` as holding an in-flight slot, honoring the
+        ``max_inflight_requests`` limit. The slot is held from the moment the
+        request is registered until its result/exception arrives, the request
+        is aborted locally, or the connection is closed.
+
+        :param slot_timeout: ``0`` rejects immediately when the limit is
+                             reached; a positive number waits at most that
+                             many seconds for a slot to be released.
+        :raises: :class:`InflightLimitExceeded` if no slot became available
+        """
+        if self._config["max_inflight_requests"] is None:
+            return
+        timeout = Timeout(slot_timeout)  # None waits indefinitely, 0 rejects immediately
+        while True:
+            with self._inflight_cond:
+                limit = self._config["max_inflight_requests"]
+                if limit is None:
+                    return
+                if len(self._inflight_seqs) < limit:
+                    self._inflight_seqs.add(seq)
+                    return
+                if self._closed:
+                    raise EOFError("connection is closed")
+                if timeout.expired():
+                    raise InflightLimitExceeded(
+                        f"in-flight request limit ({limit}) reached")
+                interval = min(0.1, timeout.timeleft()) if timeout.finite else 0.1
+            # Make bounded progress on incoming traffic while waiting: replies
+            # release slots, and reverse (reentrant) requests dispatched here
+            # may be exactly what the peer is blocked on. The wait itself does
+            # not hold _recvlock, so other threads can keep serving, and the
+            # request is not buffered anywhere before a slot is granted.
+            if not self.poll(interval):
+                with self._inflight_cond:
+                    self._inflight_cond.wait(min(0.05, timeout.timeleft()) if timeout.finite else 0.05)
+
+    def _release_inflight_slot(self, seq):
+        # set-membership makes the release idempotent: duplicate completions
+        # and config changes cannot release more slots than were acquired
+        with self._inflight_cond:
+            if seq in self._inflight_seqs:
+                self._inflight_seqs.discard(seq)
+                self._inflight_cond.notify_all()
 
     def _dispatch(self, data):  # serving---dispatch?
         msg, = brine.I1.unpack(data[:1])  # unpack just msg to minimize time to release
@@ -418,16 +491,18 @@ class Connection(object):
                     this_thread._remote_thread_id = UNBOUND_THREAD_ID
             if msg == consts.MSG_REPLY:
                 seq, args = brine.load(data[1:])
+                callback = self._pop_request_callback(seq)
                 obj = self._unbox(args)
-                self._seq_request_callback(msg, seq, False, obj)
+                self._seq_request_callback(msg, seq, False, obj, callback)
                 if not self._bind_threads:
                     self._recvlock.release()  # releasing here fixes race condition with AsyncResult.wait
             elif msg == consts.MSG_EXCEPTION:
                 if not self._bind_threads:
                     self._recvlock.release()
                 seq, args = brine.load(data[1:])
+                callback = self._pop_request_callback(seq)
                 obj = self._unbox_exc(args)
-                self._seq_request_callback(msg, seq, True, obj)
+                self._seq_request_callback(msg, seq, True, obj, callback)
             else:
                 raise ValueError(f"invalid message type: {msg!r}")
 
@@ -738,13 +813,16 @@ class Connection(object):
         :returns: the result of the request
         """
         timeout = self._config["sync_request_timeout"]
-        _async_res = self.async_request(handler, *args, timeout=timeout)
+        _async_res = self.async_request(handler, *args, timeout=timeout, slot_timeout=timeout)
         # _async_res is an instance of AsyncResult, the value property invokes Connection.serve via AsyncResult.wait
         # So, the _recvlock can be acquired multiple times by the owning thread and warrants the use of RLock
         return _async_res.value
 
-    def _async_request(self, handler, args=(), callback=(lambda a, b: None)):  # serving
+    def _async_request(self, handler, args=(), callback=(lambda a, b: None), slot_timeout=0):  # serving
         seq = self._get_seq_id()
+        if handler != consts.HANDLE_CLOSE:
+            # HANDLE_CLOSE is exempt: closing must always be able to proceed
+            self._acquire_inflight_slot(seq, slot_timeout)
         self._request_callbacks[seq] = callback
         try:
             self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
@@ -753,19 +831,31 @@ class Connection(object):
             # depending on the case, the MSG_REQUEST may or may not have been sent completely
             # so, pop the callback and raise to keep response integrity is consistent
             self._request_callbacks.pop(seq, None)
+            self._release_inflight_slot(seq)
             raise
 
     def async_request(self, handler, *args, **kwargs):  # serving
         """Send an asynchronous request (does not wait for it to finish)
 
+        :param timeout: expiry time (in seconds) for the returned
+                        :class:`~rpyc.core.async_.AsyncResult`
+        :param slot_timeout: submission mode used when the connection's
+                             ``max_inflight_requests`` limit is reached:
+                             ``0`` (the default) raises
+                             :class:`InflightLimitExceeded` immediately,
+                             a positive number waits at most that many
+                             seconds for a slot to be released, and ``None``
+                             waits indefinitely (used by internal requests)
+
         :returns: an :class:`rpyc.core.async_.AsyncResult` object, which will
                   eventually hold the result (or exception)
         """
         timeout = kwargs.pop("timeout", None)
+        slot_timeout = kwargs.pop("slot_timeout", 0)
         if kwargs:
             raise TypeError("got unexpected keyword argument(s) {list(kwargs.keys()}")
         res = AsyncResult(self)
-        self._async_request(handler, args, res)
+        self._async_request(handler, args, res, slot_timeout=slot_timeout)
         if timeout is not None:
             res.set_expiry(timeout)
         return res
